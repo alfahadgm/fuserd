@@ -1,0 +1,8 @@
+build/
+config.json
+*.db
+*.db-*
+*.log
+*.exe
+.git/
+.idea/

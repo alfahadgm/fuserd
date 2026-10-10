@@ -1,0 +1,8 @@
+/fuserd.exe
+/fuserd
+/config.json
+*.db
+*.db-shm
+*.db-wal
+/build/
+/scratch/

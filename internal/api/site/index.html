@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FUSER Community Server</title>
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+<style>
+  :root { color-scheme: dark; --bg: #120a24; --panel: #1e1338; --text: #f1ecff; --muted: #b8acd9; --accent: #ff4fb8; --code: #0b0618; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  .logo { position: relative; margin: 16px 0 32px; isolation: isolate; }
+  .logo img { display: block; width: 100%; height: auto; }
+  /* M_Logo / MI_HypeLogo_Aura: color and bloom confined to the logo alpha. */
+  @supports (mask-image: url("/logo-mask.png")) or (-webkit-mask-image: url("/logo-mask.png")) {
+    .logo::after {
+      content: ""; position: absolute; inset: 0; pointer-events: none;
+      -webkit-mask: url("/logo-mask.png") center / 100% 100% no-repeat;
+      mask: url("/logo-mask.png") center / 100% 100% no-repeat;
+      background: linear-gradient(110deg, transparent 28%, #6044ff 38%, #dd28ff 46%, #ff26b9 52%, #ff8c43 60%, transparent 72%);
+      background-size: 300% 100%; background-position: 100% 50%;
+      mix-blend-mode: screen; opacity: .85;
+      animation: logo-aura 7s linear infinite;
+    }
+  }
+  @keyframes logo-aura {
+    0% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+  @media (prefers-reduced-motion: reduce) { .logo::after { animation: none; opacity: 0; } }
+  h1 { font-size: 1.6rem; margin: 24px 0 4px; }
+  h2 { font-size: 1.2rem; margin: 32px 0 8px; }
+  p, li { color: var(--muted); }
+  section { background: var(--panel); border-radius: 12px; padding: 4px 20px 20px; margin-top: 24px; }
+  code { font-family: ui-monospace, Consolas, monospace; color: var(--text); overflow-wrap: anywhere; }
+  pre { background: var(--code); border-radius: 8px; padding: 12px; overflow-x: auto; margin: 0; }
+  pre code { white-space: pre; }
+  .row { display: flex; justify-content: flex-end; margin-top: 8px; }
+  button, a.button { font: inherit; color: #fff; background: var(--accent); border: 0; border-radius: 8px; padding: 8px 16px; cursor: pointer; text-decoration: none; display: inline-block; }
+  button:hover, a.button:hover { filter: brightness(1.1); }
+  .tabs { display:flex; gap:8px; margin-top:24px; border-bottom:1px solid #44305f; padding-bottom:12px; }
+  .tabs button { background:transparent; color:var(--muted); }
+  .tabs button[aria-selected="true"] { background:var(--panel); color:var(--text); box-shadow:inset 0 -3px var(--accent); }
+  .tabs span { margin-left:8px; color:#ff8cd0; font-size:13px; }
+  [hidden] { display:none!important; }
+  .preview { color:var(--muted); font-size:12px; border:1px solid #44305f; border-radius:6px; padding:3px 8px; display:inline-block; margin:16px 0 0; }
+  .overview { display:flex; align-items:center; gap:18px; padding:22px; margin-top:20px; }
+  .online-number { font-size:48px; line-height:1; font-weight:750; letter-spacing:-2px; }
+  .overview p { margin:3px 0 0; font-size:14px; }
+  .online-label { font-weight:600; }
+  .role-counts { display:flex; gap:24px; margin-top:12px; }
+  .role-counts strong { font-size:22px; color:var(--text); }
+  .role-counts span { display:block; font-size:12px; color:var(--muted); }
+  .lobby .role-counts { margin-top:14px; padding-top:12px; border-top:1px solid #39264f; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#76e4c0; margin-right:7px; }
+  .lobby-heading { display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin:24px 0 12px; }
+  .lobby-heading h2 { margin:0; } .lobby-heading p { margin:0; font-size:13px; }
+  .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+  .lobby { margin:0; padding:18px; border:1px solid #39264f; }
+  .card-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .server-id { color:var(--muted); font-size:12px; letter-spacing:.08em; }
+  .state { font-size:12px; border-radius:20px; padding:4px 9px; white-space:nowrap; }
+  .gameplay { background:#193d3a; color:#8ce8cd; } .waiting { background:#39254f; color:#d9b2ff; }
+  .loading { background:#483625; color:#f2c986; } .unknown { background:#343044; color:#c5bfd5; }
+  .lobby h3 { margin:16px 0 3px; font-size:18px; } .lobby p { font-size:13px; margin:0; }
+  .occupancy { display:flex; justify-content:space-between; align-items:baseline; margin-top:20px; }
+  .occupancy strong { font-size:22px; } .occupancy small { font-size:13px; color:var(--muted); font-weight:400; }
+  .occupancy span { font-size:12px; color:var(--muted); }
+  .meter { height:5px; background:#0b0618; border-radius:8px; margin-top:8px; overflow:hidden; }
+  .meter i { display:block; height:100%; background:var(--accent); border-radius:8px; }
+  .footnote { font-size:13px; margin-top:18px; }
+  button:focus-visible { outline:2px solid #ff8cd0; outline-offset:3px; }
+  @media(max-width:540px) { .grid { grid-template-columns:1fr; } .lobby-heading { flex-wrap:wrap; } .tabs button { padding:8px 12px; } }
+
+  /* Venue/time-of-day textures extracted from FUSER's session browser assets. */
+  .lobby { background-image: linear-gradient(180deg, rgba(12,6,28,.12), rgba(12,6,28,.65) 45%, rgba(12,6,28,.95)), var(--venue-image); background-size: cover; background-position: center; overflow: hidden; min-height: 290px; }
+  .lobby .server-id { color: #fff; font-size: 16px; font-weight: 700; letter-spacing: 0; text-shadow: 0 1px 5px #000; }
+  .lobby h3 { margin-top: 64px; }
+  .lobby p, .lobby .occupancy span, .lobby .occupancy small, .lobby .role-counts span { color: #e1d9ed; }
+  .lobby .role-counts { border-top-color: #ffffff30; }
+  .lobby .state { box-shadow: 0 2px 10px #0005; }
+
+  .tabs { flex-wrap: wrap; }
+  .diamond-card { overflow: hidden; margin-top: 20px; border: 1px solid #44305f; border-radius: 12px; background: var(--panel); }
+  .event-image { display: block; width: 100%; height: auto; }
+  .diamond-details { padding: 20px; }
+  .diamond-details h2 { margin: 0; }
+  .diamond-details p { margin: 8px 0 20px; }
+  .diamond-counts { display: flex; gap: 40px; border-top: 1px solid #44305f; padding-top: 16px; }
+  .diamond-counts strong { display: block; font-size: 32px; line-height: 1.2; }
+  .diamond-counts span { color: var(--muted); font-size: 13px; }
+
+  section h3 { font-size: 1rem; color: var(--text); margin: 24px 0 8px; }
+  a.button:focus-visible { outline:2px solid #ff8cd0; outline-offset:3px; }
+  .cta { border: 1px solid #44305f; background: linear-gradient(135deg, #2a1650, var(--panel) 60%); }
+  .cta .row { margin-top: 16px; }
+  .stock-note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; margin: 16px 0 0; font-size: 14px; }
+  .stock-note p { margin: 0; } .stock-note p + p { margin-top: 8px; }
+  .pack-download { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; margin-top: 16px; }
+  .pack-download p { margin: 0; font-size: 14px; }
+  .features { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .features li { background: #281a47; border: 1px solid #39264f; border-radius: 10px; padding: 12px 14px; font-size: 14px; }
+  .features strong { display: block; color: var(--text); font-size: 15px; margin-bottom: 2px; }
+  .features .setting { display: block; margin-top: 6px; font-size: 12px; color: #ff8cd0; }
+  @media(max-width:540px) { .features { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="logo"><img src="/logo.png" alt="FUSER" width="1024" height="256"></div>
+  <h1>FUSER Community Server</h1>
+  <p>A community revival of FUSER's online features for owners of the game.</p>
+
+
+<nav class="tabs" role="tablist" aria-label="Community server"><button id="lobbies-tab" role="tab" aria-controls="lobbies-panel" aria-selected="true">Server Status <span>{{len .Status.Lobbies}}</span></button><button id="diamond-tab" role="tab" aria-controls="diamond-panel" aria-selected="false" tabindex="-1">Diamond Stage</button><button id="connect-tab" role="tab" aria-controls="connect-panel" aria-selected="false" tabindex="-1">Get connected</button><button id="modpack-tab" role="tab" aria-controls="modpack-panel" aria-selected="false" tabindex="-1">Mod pack</button></nav>
+<div id="lobbies-panel" role="tabpanel" aria-labelledby="lobbies-tab">
+<section class="overview"><div class="online-number">{{.Status.Online}}</div><div><div class="online-label"><span class="dot"></span>Players online</div><p>{{.Status.InPublic}} in public lobbies · {{.Status.Elsewhere}} elsewhere online</p><div class="role-counts"><div><strong>{{.Status.Performers}}</strong><span>Performers</span></div><div><strong>{{.Status.Viewers}}</strong><span>Viewers</span></div></div></div></section>
+<div class="lobby-heading"><h2>Public lobbies</h2><p>Snapshot at {{.Status.Updated}}</p></div>
+<div class="grid">{{range .Status.Lobbies}}
+<section class="lobby" aria-label="{{.VenueName}} {{printf "%02d" .Number}}"{{if .Image}} style="--venue-image: url('{{.Image}}')"{{end}}><div class="card-top"><span class="server-id">{{.VenueName}} {{printf "%02d" .Number}}</span><span class="state {{.StateClass}}">{{.State}}</span></div><h3>Public freestyle</h3>{{if .TimeOfDay}}<p class="venue-time">{{.TimeOfDay}}</p>{{end}}<p>{{if .Rounds}}{{.Rounds}} rounds{{end}}{{if and .Rounds .Bars}} · {{end}}{{if .Bars}}{{.Bars}} bars{{end}}</p><div class="occupancy"><strong>{{.Players}}<small>{{if .Capacity}} / {{.Capacity}}{{end}} players</small></strong>{{if .Capacity}}<span>{{if .Spaces}}{{.Spaces}} spaces{{else}}Full{{end}}</span>{{end}}</div>{{if .Capacity}}<div class="meter" aria-hidden="true"><i style="width:{{.Fill}}%"></i></div>{{end}}<div class="role-counts"><div><strong>{{.Performers}}</strong><span>Performers</span></div><div><strong>{{.Viewers}}</strong><span>Viewers</span></div></div></section>
+{{else}}<p>No active public lobbies right now. Open FUSER to start a public show.</p>{{end}}</div>
+<p class="footnote">Open FUSER to browse or join a public show. Performers and Viewers counts cover recently online members of public lobbies. Players online also includes players outside public lobbies. Reload this page for an updated snapshot.</p>
+</div>
+
+<div hidden id="diamond-panel" role="tabpanel" aria-labelledby="diamond-tab">
+{{if .Diamond.Unavailable}}<section><h2>Diamond Stage unavailable</h2><p>Event information could not be loaded. Reload to try again.</p></section>
+{{else if .Diamond.Active}}
+<article class="diamond-card" aria-label="Active Diamond Stage event">
+{{if .Diamond.Image}}<img class="event-image" src="{{.Diamond.Image}}" alt="{{.Diamond.Name}} event card" width="1280" height="720">{{end}}
+<div class="diamond-details"><div class="card-top"><h2>{{.Diamond.Name}}</h2><span class="state gameplay"><span class="dot"></span>Live now</span></div><p>Watch the current show in FUSER.</p>
+{{if .Diamond.CountsAvailable}}<div class="diamond-counts"><div><strong>{{.Diamond.Viewers}}</strong><span>Viewers</span></div><div><strong>{{.Diamond.Headliners}}</strong><span>Headliners online</span></div></div>{{else}}<p>Live viewer and headliner counts are unavailable.</p>{{end}}</div>
+</article><p class="footnote">Reload this page for updated event information and counts.</p>
+{{else}}<section><h2>No active event</h2><p>Diamond Stage is between shows. Check back for the next event.</p></section>{{end}}
+</div>
+
+<div hidden id="connect-panel" role="tabpanel" aria-labelledby="connect-tab">
+  <section>
+    <h2>Connect to this server</h2>
+    <ol>
+      <li>Close FUSER.</li>
+      <li>Open <code>%LOCALAPPDATA%\Fuser\Saved\Config\WindowsNoEditor\Game.ini</code> in a text editor (create it if it doesn't exist).</li>
+      <li>Add the lines below, then save. Keep <code>EnvironmentSettings=</code> on a single line: the game crashes if it is split.</li>
+    </ol>
+    <pre><code id="ini">{{.Ini}}</code></pre>
+    <div class="row"><button type="button" id="copy">Copy</button></div>
+    <ol start="4">
+      <li>Make <code>Game.ini</code> read-only, so the game can't overwrite your changes:
+        <ul>
+          <li>In File Explorer, right-click <code>Game.ini</code> and choose <b>Properties</b>. On the <b>General</b> tab, tick <b>Read-only</b>, then click <b>OK</b>.</li>
+          <li>Or run this in PowerShell:</li>
+        </ul>
+      </li>
+    </ol>
+    <pre><code>Set-ItemProperty "$env:LOCALAPPDATA\Fuser\Saved\Config\WindowsNoEditor\Game.ini" -Name IsReadOnly -Value $true</code></pre>
+    <p>To edit <code>Game.ini</code> later, untick <b>Read-only</b> first (or run the same command with <code>$false</code>).</p>
+    <ol start="5">
+      <li>Start FUSER.</li>
+    </ol>
+  </section>
+
+  <section class="cta">
+    <h2>Optional: add the mod pack</h2>
+    <p>You're ready to play. The free mod pack adds key and BPM display, bigger crates, song search and custom songs
+      that download automatically in multiplayer.</p>
+    <div class="stock-note">
+      {{if .SeparateStock}}<p>Without the mod pack you can still use profiles, following, invites and public lobbies, but you're matched
+        only with other players who don't have it, and you can join the Diamond Stage only during events that allow
+        the stock game.</p>{{else}}<p>Without the mod pack you can still play online, including with mod pack players.</p>{{end}}
+      <p>Custom songs aren't shared between players without the mod pack. A custom song only plays correctly when
+        everyone in the session has the same song installed; otherwise the mix is unreliable and can throw off
+        gameplay timing.</p>
+    </div>
+    <div class="row"><a class="button" href="#mod-pack" data-tab="modpack-tab">See what the mod pack adds</a></div>
+  </section>
+</div>
+
+<div hidden id="modpack-panel" role="tabpanel" aria-labelledby="modpack-tab">
+  <section>
+    <h2>Mod pack</h2>
+    <p>The FUSER Native Loader mod pack adds features to the game and lets you play custom songs online with other
+      players on this server. It's optional: the stock game can connect too.</p>
+    {{if .ModPack}}
+    <div class="pack-download">
+      <a class="button" href="/modpack" download>Download {{.ModPack.Name}}</a>
+      <p>{{.ModPack.Size}}, updated {{.ModPack.Updated}}</p>
+    </div>
+    {{else}}
+    <p>The mod pack isn't available yet.</p>
+    {{end}}
+
+    <h3>In the game</h3>
+    <ul class="features">
+      <li><strong>Key and BPM</strong>Every song item shows its key and tempo, swapping places with Genre and Year.
+        <span class="setting">Settings › General › Key and BPM Display</span></li>
+      <li><strong>Key labels</strong>Show keys as flats (D♭), sharps (C♯) or both (C♯/D♭).
+        <span class="setting">Settings › General › Key Labels</span></li>
+      <li><strong>Bigger crates</strong>Play crates of up to 144 songs and 120 snapshots in freestyle (144 slots in
+        total, up from 24 songs). Every 8 songs get their own tab, up to 18 song tabs.</li>
+      <li><strong>Crate editor</strong>Search the song library, and get a tab for every song and snapshot page of a
+        large crate.
+        <span class="setting">Settings › General › Song Search Bar</span></li>
+      <li><strong>New crate sizes</strong>Set the song and snapshot slots of new crates, up to 144 songs, without
+        editing <code>Game.ini</code>.
+        <span class="setting">Settings › General › New Crate Song Slots</span></li>
+    </ul>
+
+    <h3>Everything the original song loader does</h3>
+    <ul class="features">
+      <li><strong>Custom songs</strong>Put custom song <code>.pak</code> and <code>.sig</code> files in
+        <code>Fuser\Content\Paks\custom_songs</code> and they're in the game, free to play.</li>
+      <li><strong>Event-reward songs</strong>Songs from FUSER's past in-game events are unlocked for free.</li>
+      <li><strong>Wider BPM range</strong>Tempos from 60 to 200 BPM, up from the stock 90 to 157.</li>
+      <li><strong>No more unlock pak</strong>Add or remove custom songs without deleting
+        <code>customSongsUnlocked_P.pak</code>: songs are unlocked when the game starts. An old copy is renamed out of
+        the way for you.</li>
+    </ul>
+
+    <h3>Online on this server</h3>
+    <ul class="features">
+      <li><strong>Custom songs in multiplayer</strong>Songs other players drop that you don't have download
+        automatically, from this server or straight from the other players in your session.
+        <span class="setting">Settings › General › Download Songs, Send Songs to Other Players</span></li>
+      {{if .SeparateStock}}<li><strong>Lobbies with other mod pack players</strong>Public lobbies group mod pack players together, so
+        everyone hears each other's custom songs.</li>{{end}}
+      {{if .MainStage}}<li><strong>Diamond Stage</strong>Book headliner slots and join Diamond Stage events.</li>{{end}}
+      <li><strong>Diamond Store</strong>Songs you buy in the Diamond Store install themselves.</li>
+      {{if .CrateLimit}}<li><strong>Crate check</strong>This server allows up to {{.CrateLimit}} songs in a multiplayer crate. The mod
+        pack checks your crate before you join, so everyone's custom songs sync in time.</li>{{end}}
+    </ul>
+  </section>
+</div>
+</main>
+<script>
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  function activate(tab) { tabs.forEach(t => { const active = t === tab; t.setAttribute('aria-selected', String(active)); t.tabIndex = active ? 0 : -1; document.getElementById(t.getAttribute('aria-controls')).hidden = !active; }); }
+  tabs.forEach((tab, index) => { tab.addEventListener('click', () => activate(tab)); tab.addEventListener('keydown', e => { let next; if(e.key === 'ArrowRight') next = tabs[(index+1)%tabs.length]; if(e.key === 'ArrowLeft') next = tabs[(index+tabs.length-1)%tabs.length]; if(e.key === 'Home') next = tabs[0]; if(e.key === 'End') next = tabs[tabs.length-1]; if(next) { e.preventDefault(); activate(next); next.focus(); } }); });
+  // Links into a tab (the mod pack call to action): switch to it and bring the tab bar into view.
+  document.querySelectorAll('[data-tab]').forEach(link => link.addEventListener('click', e => {
+    const tab = document.getElementById(link.dataset.tab);
+    if (!tab) return;
+    e.preventDefault();
+    activate(tab);
+    tab.focus();
+    tab.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }));
+  if (location.hash === '#mod-pack') activate(document.getElementById('modpack-tab'));
+
+
+  document.getElementById('copy').addEventListener('click', function () {
+    var b = this, ini = document.getElementById('ini');
+    function done() {
+      b.textContent = 'Copied';
+      setTimeout(function () { b.textContent = 'Copy'; }, 1500);
+    }
+    function selectIni() { // plain HTTP has no clipboard API: select the text for Ctrl+C instead
+      var range = document.createRange();
+      range.selectNodeContents(ini);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      try { if (document.execCommand('copy')) done(); } catch (e) {}
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(ini.textContent).then(done, selectIni);
+    } else {
+      selectIni();
+    }
+  });
+</script>
+</body>
+</html>

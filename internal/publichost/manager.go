@@ -5,6 +5,7 @@ package publichost
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,6 +18,10 @@ import (
 )
 
 var ErrCapacity = errors.New("no public server available")
+
+// ErrPaused: new servers are not started for now, after repeated launch failures (the fleet backoff) or, for the
+// Main Stage server, while its relaunch backs off.
+var ErrPaused = errors.New("server launches paused after repeated failures")
 
 // Errors of the FDS registration API (Register / UpdateStatus / ReportExit).
 var (
@@ -39,6 +44,12 @@ type Config struct {
 	// TokenPublicKey is the public key of fuserd's session-token signer (fdstoken); an FDS container that has it
 	// admits only clients with a valid token (FDS_TOKEN_PUBLIC_KEY). Empty: containers admit anyone.
 	TokenPublicKey string
+	// WarmServers is the number of public servers with no player and no reservation kept waiting for tickets (the
+	// warm pool, set by KeepWarm; 0 = none), started for WarmRounds rounds. WarmKeepMainStage: the pool leaves a
+	// slot for the Main Stage server while it is not running.
+	WarmServers       int
+	WarmRounds        int
+	WarmKeepMainStage bool
 }
 
 type Key struct{ Rounds, Measures int }
@@ -86,6 +97,15 @@ type Slot struct {
 	registered Registration
 	// live is its newest player list (UpdateStatus).
 	live Live
+	// recycling: the container passed FDS_MAX_UPTIME_HOURS and exits once it is empty (recycle_pending). It takes no
+	// new tickets, viewers or joins, but is still alive.
+	recycling bool
+	// warm: started by the warm pool (KeepWarm), so it may wait for players longer than an unused server.
+	warm bool
+	// adopted: a container a previous fuserd left running, taken over at startup (Recover).
+	adopted bool
+	// portConflict: the container came up on other ports than the slot's (Register); its stop is not a launch failure.
+	portConflict bool
 }
 
 // Registration is an FDS container's POST /fds/v1/register body.
@@ -99,6 +119,30 @@ type Registration struct {
 	TimeOfDay   string `json:"time_of_day"`
 	Rounds      int    `json:"rounds"`
 	TurnMeasure int    `json:"turn_measures"`
+	// portsReported, beaconReported: the body named "port" / "beacon_port". FDS always sends both, as the ports it actually bound,
+	// with 0 for one it isn't listening on; Register then checks them, 0 included.
+	portsReported, beaconReported bool
+}
+
+// UnmarshalJSON decodes the body and records which of "port" and "beacon_port" it named.
+func (r *Registration) UnmarshalJSON(b []byte) error {
+	type plain Registration
+	var fields struct {
+		plain
+		Port       *int `json:"port"`
+		BeaconPort *int `json:"beacon_port"`
+	}
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return err
+	}
+	*r = Registration(fields.plain)
+	if fields.Port != nil {
+		r.Port, r.portsReported = *fields.Port, true
+	}
+	if fields.BeaconPort != nil {
+		r.BeaconPort, r.beaconReported = *fields.BeaconPort, true
+	}
+	return nil
 }
 
 // Status is an FDS container's POST /fds/v1/status body (its heartbeat).
@@ -113,6 +157,8 @@ type Status struct {
 	Members   []Member `json:"members"`
 	CurrentDJ int64    `json:"current_dj"`
 	Event     string   `json:"event"`
+	// RecyclePending: the container is past FDS_MAX_UPTIME_HOURS and exits once it is empty and in the Lobby.
+	RecyclePending bool `json:"recycle_pending"`
 }
 
 // Member is one connected player: team is "dj", "spectator" or "unknown".
@@ -162,7 +208,43 @@ type Manager struct {
 	start func(*Slot)
 	// runningPorts lists the game ports of running fuserd-* containers (dockerPorts); tests replace it.
 	runningPorts func() map[int]bool
+	// docker runs a docker CLI command and returns its standard output (Recover, stopContainer); tests replace it.
+	docker func(ctx context.Context, args ...string) ([]byte, error)
+	// supervise watches an adopted container until it exits (superviseAdopted) and calls runWG.Done; tests replace it.
+	supervise func(*Slot)
+	// portFree reports whether a game port and its beacon port can be bound here (udpPortsFree); tests replace it.
+	portFree func(port int) bool
+	// portCooldown holds ports not to start a server on until the time given: a container came up on other ports
+	// than it was given, or another program holds them.
+	portCooldown map[int]time.Time
+	// launchFails are the recent launch failures (a container that stopped before registering); pausedUntil and
+	// pauseTrips are the fleet backoff they trigger (recordLaunchFailure).
+	launchFails []time.Time
+	pausedUntil time.Time
+	pauseTrips  int
+	// mainStageFails and mainStageNext back off the Main Stage server's relaunch after it fails (mainStageStopped).
+	mainStageFails int
+	mainStageNext  time.Time
 }
+
+// Launch failure backoff: launchFailMax failures (containers that stop before registering) within launchFailWindow
+// pause every launch for launchPauseBase, doubled on each further trip up to launchPauseMax. A server that registers
+// resets it.
+const (
+	launchFailWindow = 10 * time.Minute
+	launchFailMax    = 3
+	launchPauseBase  = 2 * time.Minute
+	launchPauseMax   = 30 * time.Minute
+)
+
+// mainStageBackoff is the wait before the Main Stage server is started again after consecutive failures.
+var mainStageBackoff = []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute}
+
+// portCooldownFor is how long a port another program holds, or a container came up beside, is skipped.
+const portCooldownFor = 5 * time.Minute
+
+// beaconOffset: an FDS container answers session-browser beacon queries on its game port + 100.
+const beaconOffset = 100
 
 func New(cfg Config, log *slog.Logger) *Manager {
 	if cfg.StartupTimeout <= 0 {
@@ -177,9 +259,13 @@ func New(cfg Config, log *slog.Logger) *Manager {
 	if cfg.Heartbeat <= 0 {
 		cfg.Heartbeat = 10 * time.Second
 	}
-	m := &Manager{cfg: cfg, log: log, slots: make(map[string]*Slot), events: make(chan Event, 128), exiting: make(chan struct{})}
+	m := &Manager{cfg: cfg, log: log, slots: make(map[string]*Slot), events: make(chan Event, 128), exiting: make(chan struct{}),
+		portCooldown: map[int]time.Time{}}
 	m.start = m.runFDS
 	m.runningPorts = dockerPorts
+	m.docker = runDocker
+	m.supervise = m.superviseAdopted
+	m.portFree = udpPortsFree
 	return m
 }
 
@@ -200,11 +286,19 @@ func randomTimeOfDay() string { return timesOfDay[mrand.IntN(len(timesOfDay))] }
 
 func (m *Manager) Events() <-chan Event { return m.events }
 
+// reservationLifetime is how long a reservation holds a place for a player who doesn't arrive, counted from when
+// the server became ready at the earliest: a container still starting keeps its reservations.
+const reservationLifetime = 2 * time.Minute
+
 func pruneReservations(s *Slot) {
-	cutoff := time.Now().Add(-2 * time.Minute)
+	if !s.readyFlag {
+		return // still starting: its tickets are waiting for it
+	}
+	cutoff := time.Now().Add(-reservationLifetime)
+	live := func(at time.Time) bool { return at.After(cutoff) || s.readyAt.After(cutoff) }
 	kept := s.reservedAt[:0]
 	for _, at := range s.reservedAt {
-		if at.After(cutoff) {
+		if live(at) {
 			kept = append(kept, at)
 		}
 	}
@@ -212,11 +306,21 @@ func pruneReservations(s *Slot) {
 	s.reserved = len(kept)
 	djKept := s.djReservedAt[:0]
 	for _, at := range s.djReservedAt {
-		if at.After(cutoff) {
+		if live(at) {
 			djKept = append(djKept, at)
 		}
 	}
 	s.djReservedAt = djKept
+}
+
+// refreshOldest renews the oldest reservation of list (moving it to the end, which keeps the list in time order).
+func refreshOldest(list []time.Time, now time.Time) []time.Time {
+	if len(list) == 0 {
+		return list
+	}
+	copy(list, list[1:])
+	list[len(list)-1] = now
+	return list
 }
 
 // performers is a slot's DJs for the performer-slot check: the DJs the container reported plus the DJ tickets
@@ -268,7 +372,8 @@ func (m *Manager) ReserveAnyForExcept(keys []Key, venue, timeOfDay string, skip 
 		// Only the round count is compared. A public ticket's turn_length is not the player's choice: the client
 		// builds it from the round choice too (FUN_1407596c0 reads _publicCoopRoundNumIndex), so 1 round + 64 bars
 		// arrives as 1/32. The turn length is set in the server by the first player's
-		// ServerSetCoopRoundNumTurnMeasures, which carries the real choice.
+		// ServerSetCoopRoundNumTurnMeasures (FDS leaves the set length at -1 so the client sends it); a public server
+		// takes only its turn length and keeps the ticket's round count, which this matching relies on.
 		compatible := false
 		for _, k := range keys {
 			if s.roundsOf() == k.Rounds {
@@ -276,7 +381,7 @@ func (m *Manager) ReserveAnyForExcept(keys []Key, venue, timeOfDay string, skip 
 				break
 			}
 		}
-		if compatible && !s.Private && !s.MainStage && !s.stopped && !s.draining && s.remote+s.reserved < m.cfg.MaxPlayers &&
+		if compatible && !s.Private && !s.MainStage && s.placeable() && s.remote+s.reserved < m.cfg.MaxPlayers &&
 			(!dj || m.cfg.MaxDJs <= 0 || s.performers() < m.cfg.MaxDJs) && (skip == nil || !skip(s.ID)) {
 			s.reserve(dj)
 			return s, nil
@@ -309,7 +414,11 @@ func (m *Manager) EnsureMainStage(venue, timeOfDay string, maxPlayers int) (*Slo
 			return s, nil
 		}
 	}
-	s, err := m.newSlotWith(Key{}, venue, timeOfDay, false, true, false, maxPlayers)
+	if wait := time.Until(m.mainStageNext); wait > 0 {
+		return nil, fmt.Errorf("%w: main stage server failed %d time(s) in a row; next start in %s", ErrPaused,
+			m.mainStageFails, wait.Round(time.Second))
+	}
+	s, err := m.newSlotWith(slotSpec{venue: venue, timeOfDay: timeOfDay, mainStage: true, maxPlayers: maxPlayers})
 	if err == nil {
 		m.log.Info("main stage server starting", "slot", s.ID, "port", s.Port, "venue", venue, "time_of_day", s.TimeOfDay,
 			"max_players", maxPlayers)
@@ -350,13 +459,35 @@ func (m *Manager) MainStageServer() (address string, port int, ready bool) {
 	return "", 0, false
 }
 
-// newSlot starts a server on the first free port. Called with m.mu held.
+// newSlot starts a server on the first free port for a ticket, which it reserves a place for. Called with m.mu held.
 func (m *Manager) newSlot(k Key, venue, timeOfDay string, private, mainStage, dj bool) (*Slot, error) {
-	return m.newSlotWith(k, venue, timeOfDay, private, mainStage, dj, m.cfg.MaxPlayers)
+	return m.newSlotWith(slotSpec{key: k, venue: venue, timeOfDay: timeOfDay, private: private, mainStage: mainStage,
+		dj: dj, reserve: !mainStage, maxPlayers: m.cfg.MaxPlayers})
 }
 
-func (m *Manager) newSlotWith(k Key, venue, timeOfDay string, private, mainStage, dj bool, maxPlayers int) (*Slot, error) {
+// slotSpec is what newSlotWith starts: reserve takes a place for the ticket that starts it (a DJ's also a performer
+// slot); warm marks a warm-pool server (KeepWarm).
+type slotSpec struct {
+	key                             Key
+	venue, timeOfDay                string
+	private, mainStage, dj, reserve bool
+	warm                            bool
+	maxPlayers                      int
+}
+
+// newSlotWith starts a server on the first free port: one no slot or fuserd-* container holds, not cooling down
+// (portCooldown) and that can be bound here. ErrPaused while the launch backoff lasts. When every slot or port is
+// taken, a server other than a warm one retires an idle warm server (retireWarm), whose slot frees up once its container has
+// exited; this call still fails. Called with m.mu held.
+func (m *Manager) newSlotWith(spec slotSpec) (*Slot, error) {
+	now := time.Now()
+	if now.Before(m.pausedUntil) {
+		return nil, ErrPaused
+	}
 	if len(m.slots) >= m.cfg.MaxServers {
+		if !spec.warm {
+			m.retireWarm()
+		}
 		return nil, ErrCapacity
 	}
 	// Containers a previous fuserd left running (Close) still hold their ports.
@@ -364,36 +495,52 @@ func (m *Manager) newSlotWith(k Key, venue, timeOfDay string, private, mainStage
 	for _, s := range m.slots {
 		used[s.Port] = true
 	}
+	for p, until := range m.portCooldown {
+		if !now.Before(until) {
+			delete(m.portCooldown, p)
+		}
+	}
 	port := 0
-	for i := 0; i < m.cfg.MaxServers; i++ {
+	for i := 0; i < m.cfg.MaxServers && port == 0; i++ {
 		candidate := m.cfg.BasePort + i*m.cfg.PortStep
-		if !used[candidate] {
+		switch {
+		case used[candidate]:
+		case !m.portCooldown[candidate].IsZero() || !m.portCooldown[candidate+beaconOffset].IsZero():
+		case !m.portFree(candidate):
+			// Another program holds the game or beacon port: the container would come up on other ports.
+			m.portCooldown[candidate] = now.Add(portCooldownFor)
+			m.log.Warn("public server port held by another program: skipping it", "port", candidate,
+				"beacon_port", candidate+beaconOffset, "cooldown", portCooldownFor)
+		default:
 			port = candidate
-			break
 		}
 	}
 	if port == 0 {
+		if !spec.warm {
+			m.retireWarm() // every port is held, some by idle warm servers
+		}
 		return nil, ErrCapacity
 	}
 	kind := "public"
-	if private {
+	if spec.private {
 		kind = "private"
 	}
-	if mainStage {
+	if spec.mainStage {
 		kind = "mainstage"
 	}
-	id := fmt.Sprintf("fuserd-%s-%d-%d", kind, time.Now().UnixNano(), port)
+	id := fmt.Sprintf("fuserd-%s-%d-%d", kind, now.UnixNano(), port)
 	token, err := newRegistrationToken()
 	if err != nil {
 		return nil, err
 	}
-	s := &Slot{ID: id, Key: k, TimeOfDay: randomTimeOfDay(), Venue: venue, Private: private, MainStage: mainStage,
-		MaxPlayers: maxPlayers, Address: m.cfg.Address, Port: port, ready: make(chan struct{}), regToken: token}
-	if TimeOfDayValid(timeOfDay) {
-		s.TimeOfDay = timeOfDay
+	s := &Slot{ID: id, Key: spec.key, TimeOfDay: randomTimeOfDay(), Venue: spec.venue, Private: spec.private,
+		MainStage: spec.mainStage, MaxPlayers: spec.maxPlayers, Address: m.cfg.Address, Port: port,
+		ready: make(chan struct{}), regToken: token, warm: spec.warm}
+	if TimeOfDayValid(spec.timeOfDay) {
+		s.TimeOfDay = spec.timeOfDay
 	}
-	if !mainStage {
-		s.reserve(dj)
+	if spec.reserve {
+		s.reserve(spec.dj)
 	}
 	m.slots[id] = s
 	m.runWG.Add(1)
@@ -414,7 +561,7 @@ func (m *Manager) ReserveExistingExcept(skip func(slotID string) bool) (*Slot, e
 	var best *Slot
 	for _, s := range m.slots {
 		pruneReservations(s)
-		if m.closed || s.Private || s.MainStage || s.stopped || s.draining || s.remote+s.reserved >= m.cfg.MaxPlayers ||
+		if m.closed || s.Private || s.MainStage || !s.placeable() || s.remote+s.reserved >= m.cfg.MaxPlayers ||
 			(skip != nil && skip(s.ID)) {
 			continue
 		}
@@ -436,19 +583,44 @@ func (m *Manager) ReserveSlot(id string) error {
 	if s != nil {
 		pruneReservations(s)
 	}
-	if s == nil || s.MainStage || !s.readyFlag || s.stopped || s.draining || s.remote+s.reserved >= m.cfg.MaxPlayers {
+	if s == nil || s.MainStage || !s.readyFlag || !s.placeable() || s.remote+s.reserved >= m.cfg.MaxPlayers {
 		return ErrCapacity
 	}
 	s.reserve(false)
 	return nil
 }
 
-func (m *Manager) Release(id string) {
+// Release gives back one reservation of the slot (a ticket that was cancelled or not placed); dj also gives back the
+// performer slot a DJ ticket's reservation took.
+func (m *Manager) Release(id string, dj bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s := m.slots[id]; s != nil && s.reserved > 0 {
+	s := m.slots[id]
+	if s == nil {
+		return
+	}
+	if s.reserved > 0 {
 		s.reservedAt = s.reservedAt[1:]
 		s.reserved--
+	}
+	if dj && len(s.djReservedAt) > 0 {
+		s.djReservedAt = s.djReservedAt[1:]
+	}
+}
+
+// Refresh renews a reservation of the slot (the oldest; a DJ's performer one too) for a ticket still being placed
+// there: the client polls a PLACING ticket every few seconds, so a ticket that is still wanted keeps its place.
+func (m *Manager) Refresh(id string, dj bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.slots[id]
+	if s == nil || s.stopped {
+		return
+	}
+	now := time.Now()
+	s.reservedAt = refreshOldest(s.reservedAt, now)
+	if dj {
+		s.djReservedAt = refreshOldest(s.djReservedAt, now)
 	}
 }
 
@@ -469,8 +641,11 @@ func (m *Manager) Available(id string) bool {
 	if s != nil {
 		pruneReservations(s)
 	}
-	return s != nil && s.readyFlag && !s.stopped && !s.draining && s.remote+s.reserved < m.cfg.MaxPlayers
+	return s != nil && s.readyFlag && s.placeable() && s.remote+s.reserved < m.cfg.MaxPlayers
 }
+
+// placeable reports whether the slot may take new players: not stopped, not draining and not waiting to recycle.
+func (s *Slot) placeable() bool { return !s.stopped && !s.draining && !s.recycling }
 
 // Close runs as fuserd exits. Only the Main Stage server is stopped (fuserd starts a new one when it comes back):
 // public and private session containers keep serving their players and exit by themselves once empty. Their
@@ -575,7 +750,54 @@ func (m *Manager) markReady(s *Slot) *Event {
 	s.readyFlag = true
 	s.readyAt = time.Now()
 	close(s.ready)
+	// A server that comes up ends the launch backoff.
+	m.launchFails, m.pauseTrips = nil, 0
 	return &Event{SlotID: s.ID, Ready: true}
+}
+
+// recordLaunchFailure counts a container that stopped before registering and pauses every launch once there were
+// launchFailMax in launchFailWindow: a fault every launch would hit (image, mounts, docker) is not retried at once.
+// Called with m.mu held.
+func (m *Manager) recordLaunchFailure(s *Slot, err error) {
+	now := time.Now()
+	kept := m.launchFails[:0]
+	for _, at := range m.launchFails {
+		if now.Sub(at) < launchFailWindow {
+			kept = append(kept, at)
+		}
+	}
+	m.launchFails = append(kept, now)
+	if len(m.launchFails) < launchFailMax {
+		return
+	}
+	m.pauseTrips++
+	pause := launchPauseBase << min(m.pauseTrips-1, 10)
+	if pause > launchPauseMax {
+		pause = launchPauseMax
+	}
+	m.pausedUntil = now.Add(pause)
+	m.launchFails = nil
+	m.log.Warn("server launches paused after repeated failures", "failures", launchFailMax, "window", launchFailWindow,
+		"pause", pause, "trip", m.pauseTrips, "last_slot", s.ID, "last_err", err)
+}
+
+// mainStageStopped backs off the Main Stage server's next start: a server that ran a while and exited cleanly
+// (its scheduled restart) is started again at once; after a failure the wait grows through mainStageBackoff, the
+// count starting over when the failed server had run at least 10 minutes. Called with m.mu held.
+func (m *Manager) mainStageStopped(s *Slot, err error) {
+	ranLong := s.readyFlag && time.Since(s.readyAt) >= 10*time.Minute
+	if err == nil && s.readyFlag {
+		m.mainStageFails, m.mainStageNext = 0, time.Time{}
+		return
+	}
+	if ranLong {
+		m.mainStageFails = 0
+	}
+	m.mainStageFails++
+	wait := mainStageBackoff[min(m.mainStageFails, len(mainStageBackoff))-1]
+	m.mainStageNext = time.Now().Add(wait)
+	m.log.Warn("main stage server failed: backing off its restart", "slot", s.ID, "failures", m.mainStageFails,
+		"wait", wait, "err", err)
 }
 
 func (m *Manager) applyStatus(s *Slot, count, stage int) *Event {
@@ -632,7 +854,8 @@ func (m *Manager) unhealthy(id string) string {
 	if time.Since(last) > max(3*m.cfg.Heartbeat, 30*time.Second) { // three missed heartbeats
 		return "status stalled"
 	}
-	if !s.MainStage && !s.seenRemote && s.reserved == 0 && time.Since(s.readyAt) > 5*time.Minute {
+	// A warm-pool server waits for players as long as it takes.
+	if !s.MainStage && !s.warm && !s.seenRemote && s.reserved == 0 && time.Since(s.readyAt) > 5*time.Minute {
 		return "no player connected after startup"
 	}
 	return ""
@@ -646,6 +869,14 @@ func (m *Manager) stop(id string, err error) {
 		return
 	}
 	s.stopped, s.err = true, err
+	if !m.closed {
+		if s.MainStage {
+			m.mainStageStopped(s, err)
+		}
+		if !s.readyFlag && !s.portConflict {
+			m.recordLaunchFailure(s, err)
+		}
+	}
 	if !s.readyFlag {
 		close(s.ready)
 	}

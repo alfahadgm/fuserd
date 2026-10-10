@@ -33,26 +33,28 @@ const Prefix = "/api/"
 const maxBodyBytes = 1 << 20
 
 type Server struct {
-	cfg         config.Config
-	store       *store.Store
-	tokens      *token.Issuer
-	verifiers   map[string]platform.Verifier
-	logs        *logx.Logs
-	mm          *matchmaking.Manager
-	public      *publichost.Manager
-	catalog     *catalog.Live
-	limiter     *rateLimiter
-	p2pLimit    *rateLimiter // p2p/ signaling, per player (per address for p2p/config/)
-	p2p         *p2p.Registry
-	songs       *songxfer.Registry // song transfers between players
-	relay       *turnrelay.Relay
-	dlcManifest *dlcManifest  // pc_asset_download_url's file; nil = not served
-	pics        picUploads    // profile picture upload URLs handed out (profilepic.go)
-	ms          msCache       // the Main Stage schedule snapshot (mainstage.go)
-	msPass      msPasses      // Main Stage join passes (mainstage_server.go)
-	loaders     loaderReports // who runs the loader: the stock / modded split (loader.go)
-	featured    featuredCrops // featured Diamond Store art cropped to 8:15 (featured.go)
-	now         func() time.Time
+	cfg          config.Config
+	store        *store.Store
+	tokens       *token.Issuer
+	verifiers    map[string]platform.Verifier
+	logs         *logx.Logs
+	mm           *matchmaking.Manager
+	public       *publichost.Manager
+	catalog      *catalog.Live
+	limiter      *rateLimiter
+	p2pLimit     *rateLimiter // p2p/ signaling, per player (per address for p2p/config/)
+	p2p          *p2p.Registry
+	songs        *songxfer.Registry // song transfers between players
+	relay        *turnrelay.Relay
+	dlcManifest  *dlcManifest  // pc_asset_download_url's file; nil = not served
+	pics         picUploads    // profile picture upload URLs handed out (profilepic.go)
+	ms           msCache       // the Main Stage schedule snapshot (mainstage.go)
+	msPass       msPasses      // Main Stage join passes (mainstage_server.go)
+	loaders      loaderReports // who runs the loader: the stock / modded split (loader.go)
+	blocked      blockedLog    // the custom songs last held back on each FDS server (fds.go)
+	modPackStamp modPackStamp  // the mod pack and its installer prepared for serving (site.go)
+	featured     featuredCrops // featured Diamond Store art cropped to 8:15 (featured.go)
+	now          func() time.Time
 	// liveOverride replaces the Main Stage server's live player list in tests (mainstage.go).
 	liveOverride func() (publichost.Live, bool)
 }
@@ -231,6 +233,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /favicon.ico", s.serveFavicon)
 	mux.HandleFunc("GET /robots.txt", s.serveRobots)
 	mux.HandleFunc("GET /modpack", s.serveModPack)
+	mux.HandleFunc("GET /modpack/version", s.serveModPackVersion)
+	mux.HandleFunc("GET /setup", s.serveSetup)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		s.logs.For(logx.HTTP).Warn("unknown endpoint", "method", r.Method, "path", r.URL.Path)
 		writeJSON(w, http.StatusNotFound, encodeError(&apiError{http.StatusNotFound, codeUnknown, "unknown endpoint"}))

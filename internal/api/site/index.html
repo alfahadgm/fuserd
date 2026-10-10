@@ -99,6 +99,7 @@
   .stock-note p { margin: 0; } .stock-note p + p { margin-top: 8px; }
   .pack-download { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; margin-top: 16px; }
   .pack-download p { margin: 0; font-size: 14px; }
+  section p a:not(.button) { color: #ff8cd0; }
   .features { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .features li { background: #281a47; border: 1px solid #39264f; border-radius: 10px; padding: 12px 14px; font-size: 14px; }
   .features strong { display: block; color: var(--text); font-size: 15px; margin-bottom: 2px; }
@@ -135,8 +136,23 @@
 </div>
 
 <div hidden id="connect-panel" role="tabpanel" aria-labelledby="connect-tab">
+  {{if and .ModPack .ModPack.SetupSize}}
+  <section class="cta" id="setup">
+    <h2>Install with FUSER Online Setup</h2>
+    <p>The easiest way to play on this server. On Windows:</p>
+    <ol>
+      <li>Download and run <code>FUSEROnline-Setup.exe</code>.</li>
+      <li>It finds FUSER from Steam or the Epic Games Store, points the game at this server and installs the mod pack.</li>
+      <li>Click <b>Play</b>. Run the setup again any time to check for updates and start the game.</li>
+    </ol>
+    <div class="pack-download">
+      <a class="button" href="/setup" download>Download FUSER Online Setup</a>
+      <p>{{.ModPack.SetupSize}}{{if .ModPack.Version}}, mod pack {{.ModPack.Version}}{{end}}</p>
+    </div>
+  </section>
+  {{end}}
   <section>
-    <h2>Connect to this server</h2>
+    <h2>{{if and .ModPack .ModPack.SetupSize}}Or connect by hand{{else}}Connect to this server{{end}}</h2>
     <ol>
       <li>Close FUSER.</li>
       <li>Open <code>%LOCALAPPDATA%\Fuser\Saved\Config\WindowsNoEditor\Game.ini</code> in a text editor (create it if it doesn't exist).</li>
@@ -181,10 +197,20 @@
     <p>The FUSER Native Loader mod pack adds features to the game and lets you play custom songs online with other
       players on this server. It's optional: the stock game can connect too.</p>
     {{if .ModPack}}
+    {{if .ModPack.SetupSize}}
+    <div class="pack-download">
+      <a class="button" href="/setup" download>Download FUSER Online Setup</a>
+      <p>{{.ModPack.SetupSize}}{{if .ModPack.Version}}, version {{.ModPack.Version}}{{end}}, updated {{.ModPack.Updated}}</p>
+    </div>
+    <p>Run it: it finds FUSER from Steam or the Epic Games Store, installs the mod pack, points the game at this
+      server, then click <b>Play</b>. It checks for updates each time you run it.</p>
+    <p>Or <a href="/modpack" download>download {{.ModPack.Name}}</a> ({{.ModPack.Size}}) to install by hand.</p>
+    {{else}}
     <div class="pack-download">
       <a class="button" href="/modpack" download>Download {{.ModPack.Name}}</a>
       <p>{{.ModPack.Size}}, updated {{.ModPack.Updated}}</p>
     </div>
+    {{end}}
     {{else}}
     <p>The mod pack isn't available yet.</p>
     {{end}}

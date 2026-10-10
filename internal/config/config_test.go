@@ -50,6 +50,27 @@ func TestPublicServers(t *testing.T) {
 	if err := c.validate(); err == nil {
 		t.Error("accepted a zero heartbeat")
 	}
+	// The warm pool is off by default, and leaves a slot free for tickets (and one for the Main Stage when it is on).
+	if p := Default().Multiplayer.PublicServers; p.WarmServers != 0 || p.WarmRounds != 1 {
+		t.Errorf("warm pool defaults: %d servers, %d rounds", p.WarmServers, p.WarmRounds)
+	}
+	warm := publicServers("")
+	warm.MainStage.Enabled = false
+	warm.Multiplayer.PublicServers.WarmServers = warm.Multiplayer.PublicServers.MaxServers - 1
+	if err := warm.validate(); err != nil {
+		t.Errorf("warm_servers = max_servers-1: %v", err)
+	}
+	warm.MainStage.Enabled = true
+	if err := warm.validate(); err == nil {
+		t.Error("accepted warm_servers = max_servers-1 with the Main Stage on")
+	}
+	for _, bad := range []struct{ servers, rounds int }{{-1, 1}, {4, 1}, {5, 1}, {1, 0}, {1, 11}} {
+		c := publicServers("")
+		c.Multiplayer.PublicServers.WarmServers, c.Multiplayer.PublicServers.WarmRounds = bad.servers, bad.rounds
+		if err := c.validate(); err == nil {
+			t.Errorf("accepted warm_servers %d, warm_rounds %d", bad.servers, bad.rounds)
+		}
+	}
 }
 
 // A config still using the removed public_sidecars section fails to load, naming its replacement.

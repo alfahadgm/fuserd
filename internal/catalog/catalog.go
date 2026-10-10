@@ -388,14 +388,18 @@ func InspectPak(path string) (Inspection, error) {
 }
 
 // ownedBySong says whether a (lower-case) pak entry belongs to song sn: its stems, its CelSongSet folder or its album
-// art. Anything else could replace base-game content.
+// art (t_<sn> or t_<sn>_small, as .uasset, .uexp or .ubulk). Anything else could replace base-game content, including
+// another song's art (t_<sn>foo would match a plain prefix test).
 func ownedBySong(name, sn string) bool {
 	if strings.HasPrefix(name, "audio/songs/"+sn+"/") || strings.HasPrefix(name, "dlc/songs/"+sn+"/") {
 		return true
 	}
 	if art, ok := strings.CutPrefix(name, "ui/albumart/t_"+sn); ok {
-		art = strings.TrimSuffix(strings.TrimSuffix(art, ".uasset"), ".uexp")
-		return art == "" || art == "_small"
+		for _, ext := range []string{".uasset", ".uexp", ".ubulk"} {
+			if stem, ok := strings.CutSuffix(art, ext); ok {
+				return stem == "" || stem == "_small"
+			}
+		}
 	}
 	return false
 }

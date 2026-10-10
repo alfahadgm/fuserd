@@ -49,9 +49,27 @@ func (m *Manager) Register(id, token string, r Registration) error {
 		m.mu.Unlock()
 		return err
 	}
-	if r.Port != 0 && r.Port != s.Port {
+	portOff := (r.portsReported || r.Port != 0) && r.Port != s.Port
+	beaconOff := (r.beaconReported || r.BeaconPort != 0) && r.BeaconPort != s.Port+beaconOffset
+	if portOff || beaconOff {
+		// Another program holds the slot's ports, so the container took others (or, reporting 0, isn't listening on
+		// one), and clients can't reach it. Stop it now rather than at the startup timeout, and keep new servers off
+		// those ports for a while. A port the body leaves out isn't checked.
+		err := fmt.Errorf("registered port %d / beacon %d, slot port %d / beacon %d", r.Port, r.BeaconPort, s.Port,
+			s.Port+beaconOffset)
+		s.portConflict = true
+		until := time.Now().Add(portCooldownFor)
+		m.portCooldown[s.Port], m.portCooldown[s.Port+beaconOffset] = until, until
 		m.mu.Unlock()
-		return fmt.Errorf("registered port %d, slot port %d", r.Port, s.Port)
+		m.log.Warn("public fds came up on other ports: stopping it", "slot", id, "port", r.Port, "beacon_port", r.BeaconPort,
+			"slot_port", s.Port, "slot_beacon_port", s.Port+beaconOffset, "cooldown", portCooldownFor)
+		m.stop(id, err)
+		go func() {
+			if stopErr := m.stopContainer(id); stopErr != nil {
+				m.log.Warn("could not stop public fds", "slot", id, "err", stopErr)
+			}
+		}()
+		return err
 	}
 	s.registered = r
 	if r.Rounds > 0 && r.TurnMeasure > 0 {
@@ -94,8 +112,17 @@ func (m *Manager) UpdateStatus(id, token string, st Status) error {
 	}
 	s.djs = st.DJs
 	s.live = Live{Members: st.Members, CurrentDJ: st.CurrentDJ, Event: st.Event, At: time.Now()}
+	// Past FDS_MAX_UPTIME_HOURS the container exits once empty (in the Lobby): no new players meanwhile. The Main
+	// Stage keeps admitting (fuserd starts no other one; refusing would close the stage until it empties).
+	recycle := st.RecyclePending && !s.recycling && !s.MainStage
+	if recycle {
+		s.recycling = true
+	}
 	event := m.applyStatus(s, st.Players, st.Stage)
 	m.mu.Unlock()
+	if recycle {
+		m.log.Info("public fds due for a restart: no new players until it exits", "slot", id, "players", st.Players)
+	}
 	m.emit(event)
 	return nil
 }
@@ -192,15 +219,7 @@ func (m *Manager) runFDS(s *Slot) {
 	}
 	m.log.Info("public fds launched", "slot", s.ID, "port", s.Port, "venue", s.Venue, "time_of_day", s.TimeOfDay,
 		"rounds", s.Key.Rounds, "measures", s.Key.Measures)
-	waitDone := make(chan error, 1)
-	go func() {
-		out, err := exec.Command("docker", "wait", s.ID).CombinedOutput()
-		if err == nil && strings.TrimSpace(string(out)) != "0" {
-			err = fmt.Errorf("container exit %s", strings.TrimSpace(string(out)))
-		}
-		waitDone <- err
-	}()
-	var err error
+	waitDone := waitContainer(s.ID)
 	select {
 	case <-s.ready:
 		cancel() // registered: the startup timeout no longer applies
@@ -209,17 +228,22 @@ func (m *Manager) runFDS(s *Slot) {
 		exec.Command("docker", "stop", s.ID).Run()
 		m.stop(s.ID, <-waitDone)
 		return
-	case err = <-waitDone:
+	case err := <-waitDone:
 		m.stop(s.ID, err)
 		return
 	case <-m.leftRunning(s):
 		return // fuserd is exiting: the container keeps running (Close)
 	}
+	m.watch(s, waitDone)
+}
+
+// watch supervises a registered container until it exits (waitDone): stopped when unhealthy, removed when it exits.
+func (m *Manager) watch(s *Slot, waitDone <-chan error) {
 	watch := time.NewTicker(m.cfg.Heartbeat)
 	defer watch.Stop()
 	for {
 		select {
-		case err = <-waitDone:
+		case err := <-waitDone:
 			m.stop(s.ID, err)
 			return
 		case <-m.leftRunning(s):

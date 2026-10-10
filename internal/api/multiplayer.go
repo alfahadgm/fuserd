@@ -227,11 +227,12 @@ func publicSetKeys(self mmPlayer) ([]publichost.Key, []int, []int) {
 	var keys []publichost.Key
 	roundsOptions := acceptedInts(self.NumRounds, 3)
 	measureOptions := acceptedInts(self.TurnLength, 128)
-	// turn_length only seeds a new server's turn length (FDS_TURN_MEASURES). A DJ's public ticket pairs it with the
-	// round choice (the client reads _publicCoopRoundNumIndex for both: 1 round + 64 bars arrives as 1/32), and
-	// the server takes the real length from the first player's ServerSetCoopRoundNumTurnMeasures. Slots are
-	// matched on rounds only (publichost.ReserveAny). Only a viewer ticket lists several values; the longest is
-	// preferred.
+	// turn_length only seeds a new server's turn length (FDS_TURN_MEASURES), its fallback. A DJ's public ticket
+	// pairs it with the round choice (the client reads _publicCoopRoundNumIndex for both: 1 round + 64 bars arrives
+	// as 1/32). FDS leaves the session's set length unset (-1), so the first player's client sends
+	// ServerSetCoopRoundNumTurnMeasures; a public server keeps the ticket's round count from it and takes only the
+	// turn length (the fallback applies if no choice arrives in time). Slots are matched on rounds only
+	// (publichost.ReserveAny). Only a viewer ticket lists several values; the longest is preferred.
 	sort.Sort(sort.Reverse(sort.IntSlice(measureOptions)))
 	for _, rounds := range roundsOptions {
 		for _, measures := range measureOptions {
@@ -278,7 +279,10 @@ func (s *Server) createPublicTicket(q *request, self mmPlayer, createNew bool) (
 		// "Join a public session": a server with a free performer slot, else a new one (max_djs).
 		slot, err = s.public.ReserveAnyForExcept(keys, self.VenueSelect, self.VenueTimeOfDay, skip, true)
 	}
-	if errors.Is(err, publichost.ErrCapacity) {
+	if errors.Is(err, publichost.ErrCapacity) || errors.Is(err, publichost.ErrPaused) {
+		if errors.Is(err, publichost.ErrPaused) {
+			s.mmLog().Warn("public ticket refused: server launches paused", "player", s.logs.TagID(q.playerID()))
+		}
 		return nil, &apiError{http.StatusServiceUnavailable, codeUnknown, "no public server available"}
 	}
 	if err != nil {
@@ -294,7 +298,8 @@ func (s *Server) createPublicTicket(q *request, self mmPlayer, createNew bool) (
 	if slot.Venue != "" {
 		creator.Venue = slot.Venue
 	}
-	t, ended := s.mm.CreateManagedPending(creator, slot.ID, matchmaking.QueueFreestylePublic)
+	// The ticket's reservation took a performer slot unless it is a viewer's (ReserveAnyForExcept with dj).
+	t, ended := s.mm.CreateManagedPendingAs(creator, slot.ID, matchmaking.QueueFreestylePublic, !viewer)
 	s.logEnded(ended)
 	s.placeWhenReady(t, slot)
 	s.mmLog().Info("public ticket placing", "ticket", s.logs.Tag(t.ID), "slot", slot.ID,
@@ -311,10 +316,12 @@ func (s *Server) placeWhenReady(t matchmaking.Ticket, slot *publichost.Slot) {
 		ready, startErr := s.public.State(slot.ID)
 		if !ready {
 			s.mm.FailManaged(slot.ID)
-			s.public.Release(slot.ID)
+			s.public.Release(slot.ID, t.Performer)
 			s.mmLog().Warn("managed match placement failed", "slot", slot.ID, "queue", t.Queue, "err", startErr)
-		} else if !s.mm.CompleteManaged(t.ID, slot.ID, slot.Address, slot.Port, s.cfg.Multiplayer.PublicServers.MaxPlayers) {
-			s.public.Release(slot.ID)
+		} else if _, full := s.mm.PlaceManaged(t.ID, slot.ID, slot.Address, slot.Port, s.cfg.Multiplayer.PublicServers.MaxPlayers); full {
+			// Only a ticket that failed here gives its reservation back: a cancelled one already did (cancelTicket), and
+			// releasing it again would free another ticket's place.
+			s.public.Release(slot.ID, t.Performer)
 		}
 	}()
 }
@@ -325,7 +332,7 @@ func (s *Server) placeWhenReady(t matchmaking.Ticket, slot *publichost.Slot) {
 func (s *Server) createPrivateFDSTicket(q *request, self mmPlayer) (any, error) {
 	keys, _, _ := publicSetKeys(self)
 	slot, err := s.public.ReservePrivate(keys[0], self.VenueSelect, self.VenueTimeOfDay)
-	if errors.Is(err, publichost.ErrCapacity) {
+	if errors.Is(err, publichost.ErrCapacity) || errors.Is(err, publichost.ErrPaused) {
 		return nil, &apiError{http.StatusServiceUnavailable, codeUnknown, "no server available"}
 	}
 	if err != nil {
@@ -338,7 +345,7 @@ func (s *Server) createPrivateFDSTicket(q *request, self mmPlayer) (any, error) 
 	if slot.Venue != "" {
 		creator.Venue = slot.Venue
 	}
-	t, ended := s.mm.CreateManagedPending(creator, slot.ID, matchmaking.QueueFreestylePrivate)
+	t, ended := s.mm.CreateManagedPendingAs(creator, slot.ID, matchmaking.QueueFreestylePrivate, true) // ReservePrivate: a DJ
 	s.logEnded(ended)
 	s.placeWhenReady(t, slot)
 	s.mmLog().Info("private ticket placing", "ticket", s.logs.Tag(t.ID), "slot", slot.ID, "rounds", slot.Key.Rounds,
@@ -382,6 +389,10 @@ func (s *Server) getTicket(q *request) (any, error) {
 	if !ok {
 		return nil, errBadRequest("unknown ticket")
 	}
+	if s.public != nil && t.Status == matchmaking.StatusPlacing && t.SlotID != "" {
+		// The player is still waiting for its server: its place there stays reserved.
+		s.public.Refresh(t.SlotID, t.Performer)
+	}
 	return s.ticketResult(t, sess), nil
 }
 
@@ -397,7 +408,7 @@ func (s *Server) cancelTicket(q *request) (any, error) {
 	ended, err := s.mm.CancelTicket(req.TicketID, q.playerID())
 	if s.public != nil && found && prior.Status == matchmaking.StatusPlacing {
 		// A cancelled pending ticket no longer needs its reserved connection slot.
-		s.public.Release(prior.SlotID)
+		s.public.Release(prior.SlotID, prior.Performer)
 	}
 	s.logEnded(ended)
 	if err != nil {
@@ -580,7 +591,7 @@ func (s *Server) createPlayerSession(q *request) (any, error) {
 	}
 	mem, sess, ended, err := s.mm.Join(req.GameSessionID, matchmaking.Player{ID: q.playerID()})
 	if managedSlot != "" && err != nil {
-		s.public.Release(managedSlot)
+		s.public.Release(managedSlot, false)
 	}
 	s.logEnded(ended)
 	if err != nil {

@@ -491,6 +491,11 @@ type PublicServerConfig struct {
 	// FDSSessionTokens makes player session ids signed tokens (fdstoken, key derived from token_secret) that FDS
 	// containers require at login (default true). False: containers admit any client (troubleshooting only).
 	FDSSessionTokens bool `json:"fds_session_tokens"`
+	// WarmServers keeps this many public servers up with no player, ready for the next public tickets, so players
+	// don't wait for a container to boot (default 0: off). They count against max_servers.
+	WarmServers int `json:"warm_servers"`
+	// WarmRounds is the round count warm servers start with (default 1); public tickets are matched on rounds.
+	WarmRounds int `json:"warm_rounds"`
 }
 
 // RegisterURL is the registration API's base URL for FDS containers: fds_register_url, else http://<fds_listen>.
@@ -559,7 +564,8 @@ func Default() Config {
 			SeparateStockPlayers: true,
 			PublicServers: PublicServerConfig{MaxServers: 4,
 				BasePort: 7777, PortStep: 200, MaxPlayers: 11, MaxDJs: 4, StartupTimeoutSeconds: 120,
-				FDSPakKeyEnv: "FDS_PAK_KEY", FDSHeartbeatSeconds: 10, FDSListen: "127.0.0.1:8001", FDSSessionTokens: true},
+				FDSPakKeyEnv: "FDS_PAK_KEY", FDSHeartbeatSeconds: 10, FDSListen: "127.0.0.1:8001", FDSSessionTokens: true,
+				WarmRounds: 1},
 		},
 	}
 }
@@ -671,6 +677,15 @@ func (c Config) validate() error {
 		}
 		if p.FDSPakKeyEnv == "" || p.FDSHeartbeatSeconds < 1 {
 			return errors.New("multiplayer.public_servers: fds_pak_key_env must be set and fds_heartbeat_seconds positive")
+		}
+		// The warm pool leaves a slot for ticket-started servers, and one for the Main Stage server when it is on.
+		warmMax := p.MaxServers - 1
+		if c.MainStage.Enabled {
+			warmMax--
+		}
+		if p.WarmServers < 0 || (p.WarmServers > 0 && p.WarmServers > warmMax) || p.WarmRounds < 1 || p.WarmRounds > 10 {
+			return errors.New("multiplayer.public_servers: warm_servers must be 0..max_servers-1 (max_servers-2 with " +
+				"main_stage enabled) and warm_rounds 1..10")
 		}
 	}
 	if c.Store.CatalogueFile != "" && c.Store.FilesDir == "" {

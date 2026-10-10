@@ -69,6 +69,9 @@ type Member struct {
 	Player
 	PlayerSessionID string
 	Joined          time.Time
+	// missingSince is when the member was first absent from its managed server's member list (ReconcileManaged);
+	// zero while it is reported.
+	missingSince time.Time
 }
 
 // Session is one player-hosted game session. Values handed out are copies.
@@ -111,6 +114,9 @@ type Ticket struct {
 	PlayerSessionID string
 	Created         time.Time
 	SlotID          string
+	// Performer is set on a managed ticket whose server reservation counts a performer slot (CreateManagedPendingAs):
+	// releasing the reservation releases that too.
+	Performer bool
 }
 
 // Options configures a Manager.
@@ -254,10 +260,7 @@ func (m *Manager) leave(playerID int64) []Ended {
 				ended = append(ended, Ended{before, "last player left"})
 				delete(m.sessions, id)
 			} else if s.HostID == playerID {
-				for next := range s.members {
-					s.HostID = next
-					break
-				}
+				s.HostID = earliestMember(s)
 			}
 			continue
 		}
@@ -271,9 +274,75 @@ func (m *Manager) leave(playerID int64) []Ended {
 	return ended
 }
 
+// earliestMember is the member who joined first (the lowest id on a tie), the next host of a managed session.
+// Callers hold mu; s has members.
+func earliestMember(s *session) int64 {
+	var best *Member
+	for _, mem := range s.members {
+		if best == nil || mem.Joined.Before(best.Joined) || (mem.Joined.Equal(best.Joined) && mem.ID < best.ID) {
+			best = mem
+		}
+	}
+	return best.ID
+}
+
+// ReconcileGrace is how long a member of a managed session may be missing from its server's member list before
+// ReconcileManaged drops it: long enough for a player still loading in (the loader's song install wait) or
+// reconnecting.
+const ReconcileGrace = 2 * time.Minute
+
+// ReconcileManaged brings a managed session's members in line with the member list its server reports (present, by
+// hype user id): a member the server has not reported for grace, and who joined more than grace ago, has left (a quit
+// game sends fuserd nothing). The host role passes to the earliest-joined member left. Pending tickets are not
+// touched. A session left with no member ends ("players left the server"), without draining the server: tickets
+// still being placed there start a new session. dropped is the members removed.
+func (m *Manager) ReconcileManaged(slotID string, present []int64, grace time.Duration) (dropped []int64, ended []Ended) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	here := make(map[int64]bool, len(present))
+	for _, id := range present {
+		here[id] = true
+	}
+	for id, s := range m.sessions {
+		if !s.Managed || s.SlotID != slotID {
+			continue
+		}
+		before := m.snapshot(s)
+		for pid, mem := range s.members {
+			if here[pid] {
+				mem.missingSince = time.Time{}
+				continue
+			}
+			if mem.missingSince.IsZero() {
+				mem.missingSince = now
+			}
+			if now.Sub(mem.missingSince) >= grace && now.Sub(mem.Joined) >= grace {
+				delete(s.members, pid)
+				dropped = append(dropped, pid)
+			}
+		}
+		switch {
+		case len(s.members) == 0:
+			ended = append(ended, Ended{before, "players left the server"})
+			delete(m.sessions, id)
+		case s.members[s.HostID] == nil:
+			s.HostID = earliestMember(s)
+		}
+	}
+	sort.Slice(dropped, func(i, j int) bool { return dropped[i] < dropped[j] })
+	return dropped, ended
+}
+
 // CreateManagedPending records a ticket while its Docker server starts: public, or (an FDS container of its own)
-// private.
+// private. The ticket is a Performer when the player is a DJ.
 func (m *Manager) CreateManagedPending(p Player, slotID, queue string) (Ticket, []Ended) {
+	return m.CreateManagedPendingAs(p, slotID, queue, p.IsDJ)
+}
+
+// CreateManagedPendingAs is CreateManagedPending with the ticket's Performer flag given: whether its server
+// reservation took a performer slot.
+func (m *Manager) CreateManagedPendingAs(p Player, slotID, queue string, performer bool) (Ticket, []Ended) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ended := m.expire()
@@ -282,7 +351,7 @@ func (m *Manager) CreateManagedPending(p Player, slotID, queue string) (Ticket, 
 		queue = QueueFreestylePublic
 	}
 	t := &Ticket{ID: "ticket-" + randomID(), PlayerID: p.ID, Queue: queue,
-		Status: StatusPlacing, SlotID: slotID, Created: m.now()}
+		Status: StatusPlacing, SlotID: slotID, Created: m.now(), Performer: performer}
 	m.tickets[t.ID] = t
 	m.pending[t.ID] = p
 	return *t, ended
@@ -291,12 +360,20 @@ func (m *Manager) CreateManagedPending(p Player, slotID, queue string) (Ticket, 
 // CompleteManaged places a pending player after the server has registered.
 // It is safe if a client cancelled the ticket while Docker was starting.
 func (m *Manager) CompleteManaged(ticketID, slotID, addr string, port, maxPlayers int) bool {
+	placed, _ := m.PlaceManaged(ticketID, slotID, addr, port, maxPlayers)
+	return placed
+}
+
+// PlaceManaged is CompleteManaged that also reports full: the ticket was still being placed but its session is full,
+// so it failed here and its server reservation is still held (the caller gives it back). A ticket no longer PLACING
+// (cancelled, failed) reports neither: whoever ended it gave its reservation back.
+func (m *Manager) PlaceManaged(ticketID, slotID, addr string, port, maxPlayers int) (placed, full bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t := m.tickets[ticketID]
 	p, ok := m.pending[ticketID]
 	if t == nil || !ok || t.Status != StatusPlacing || t.SlotID != slotID {
-		return false
+		return false, false
 	}
 	var s *session
 	for _, candidate := range m.sessions {
@@ -314,13 +391,13 @@ func (m *Manager) CompleteManaged(ticketID, slotID, addr string, port, maxPlayer
 	if len(s.members) >= s.MaxPlayers {
 		t.Status = StatusFailed
 		delete(m.pending, ticketID)
-		return false
+		return false, true
 	}
 	mem := &Member{Player: p, PlayerSessionID: m.managedPlayerSession(s, p.ID), Joined: m.now()}
 	s.members[p.ID] = mem
 	t.Status, t.SessionID, t.PlayerSessionID = StatusCompleted, s.ID, mem.PlayerSessionID
 	delete(m.pending, ticketID)
-	return true
+	return true, false
 }
 
 // FailManaged ends pending tickets and the browser entry for a stopped server.
@@ -571,8 +648,8 @@ func (m *Manager) Invites(target int64) (all, fresh []Invite) {
 }
 
 // presenceWindow is how recently a member must have been seen (or joined) to count as an occupant. A managed
-// session learns of no departures (its server reports counts only), so a member who left it lingers until its
-// next ticket; one who went offline stops counting after this.
+// session learns of departures from its server's member list (ReconcileManaged, after ReconcileGrace); until then,
+// and in a player-hosted session, a member who went offline stops counting after this.
 const presenceWindow = 2 * time.Minute
 
 // occupants is everyone in a session for block checks: its members still around, and, for a managed session, the

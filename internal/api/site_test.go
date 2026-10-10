@@ -1,13 +1,19 @@
 package api
 
 import (
+	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fuseronline/internal/matchmaking"
 	"image/jpeg"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -205,5 +211,169 @@ func TestVenueImagesAndNames(t *testing.T) {
 	_, body := getPage(t, srv.URL+"/")
 	if !strings.Contains(body, "No active event") || strings.Contains(body, "DESIGN PREVIEW") || strings.Index(body, `id="lobbies-tab"`) > strings.Index(body, `id="diamond-tab"`) {
 		t.Fatal("default page state or tab order incorrect")
+	}
+}
+
+// writeTestPack writes a mod pack zip with the given root files.
+func writeTestPack(t *testing.T, name string, files map[string]string) string {
+	t.Helper()
+	pack := filepath.Join(t.TempDir(), name)
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, n := range []string{"VERSION", "FUSEROnline-Setup.exe", "Fuser/Binaries/Win64/winhttp.dll", "server.txt"} {
+		body, ok := files[n]
+		if !ok {
+			continue
+		}
+		w, err := zw.Create(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.WriteString(w, body)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pack, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return pack
+}
+
+func TestModPackVersionAndSetup(t *testing.T) {
+	exe := "MZ\x90\x00fake installer PE image"
+	pack := writeTestPack(t, "FUSERNativeLoader.zip", map[string]string{"VERSION": "\xef\xbb\xbf0.13.8\r\n",
+		"FUSEROnline-Setup.exe": exe, "Fuser/Binaries/Win64/winhttp.dll": "dll", "server.txt": "old.example\r\n"})
+	srv := newTestServerWith(t, func(c *config.Config) {
+		c.PublicURL = "https://fuser.example.org:8443"
+		c.ModPackFile = pack
+	})
+
+	resp, body := getPage(t, srv.URL+"/modpack/version")
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("version: status %d, type %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	var v struct {
+		Version string `json:"version"`
+		Size    int64  `json:"size"`
+		SHA256  string `json:"sha256"`
+		URL     string `json:"url"`
+	}
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		t.Fatal(err)
+	}
+	resp, zipBody := getPage(t, srv.URL+v.URL)
+	sum := sha256.Sum256([]byte(zipBody))
+	if v.Version != "0.13.8" || v.URL != "/modpack" || v.Size != int64(len(zipBody)) || v.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("version %+v doesn't describe the %d served bytes", v, len(zipBody))
+	}
+	// The served zip is the stamped one: server.txt beside the installer holds public_url.
+	zr, err := zip.NewReader(strings.NewReader(zipBody), int64(len(zipBody)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := readZipRoot(zr, "server.txt", 1024); string(b) != "https://fuser.example.org:8443\r\n" {
+		t.Fatalf("server.txt %q", b)
+	}
+	if resp.Header.Get("ETag") == "" {
+		t.Fatal("mod pack has no ETag")
+	}
+
+	resp, setup := getPage(t, srv.URL+"/setup")
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/octet-stream" ||
+		resp.Header.Get("Content-Disposition") != `attachment; filename="FUSEROnline-Setup.exe"` {
+		t.Fatalf("setup: status %d, type %q, disposition %q", resp.StatusCode, resp.Header.Get("Content-Type"),
+			resp.Header.Get("Content-Disposition"))
+	}
+	if !strings.HasPrefix(setup, exe) || !strings.HasSuffix(setup, "FUSERCFG") {
+		t.Fatalf("setup %q", setup)
+	}
+	trailer := setup[len(exe) : len(setup)-8]
+	n := binary.LittleEndian.Uint32([]byte(trailer[len(trailer)-4:]))
+	if payload := trailer[:len(trailer)-4]; int(n) != len(payload) || payload != "server=https://fuser.example.org:8443" {
+		t.Fatalf("setup stamp %q, length %d", payload, n)
+	}
+
+	_, page := getPage(t, srv.URL+"/")
+	if !strings.Contains(page, `href="/setup"`) || !strings.Contains(page, `href="/modpack"`) || !strings.Contains(page, "Steam") {
+		t.Fatal("page lacks the setup download, the zip alternative or the instructions")
+	}
+}
+
+func TestModPackVersionAndSetupMissing(t *testing.T) {
+	// No mod pack configured, and one configured but missing.
+	for _, file := range []string{"", filepath.Join(t.TempDir(), "missing.zip")} {
+		srv := newTestServerWith(t, func(c *config.Config) {
+			c.PublicURL = "https://fuser.example.org"
+			c.ModPackFile = file
+		})
+		for _, p := range []string{"/modpack/version", "/setup"} {
+			if resp, _ := getPage(t, srv.URL+p); resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("%q %s: status %d", file, p, resp.StatusCode)
+			}
+		}
+	}
+
+	// A pack without an installer or VERSION: the zip is still served, the rest is 404.
+	pack := writeTestPack(t, "FUSERNativeLoader.zip", map[string]string{"Fuser/Binaries/Win64/winhttp.dll": "dll"})
+	srv := newTestServerWith(t, func(c *config.Config) {
+		c.PublicURL = "https://fuser.example.org"
+		c.ModPackFile = pack
+	})
+	for _, p := range []string{"/modpack/version", "/setup"} {
+		if resp, _ := getPage(t, srv.URL+p); resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("no installer %s: status %d", p, resp.StatusCode)
+		}
+	}
+	raw, _ := os.ReadFile(pack)
+	if resp, body := getPage(t, srv.URL+"/modpack"); resp.StatusCode != http.StatusOK || body != string(raw) {
+		t.Fatalf("pack without setup: status %d, not served as is", resp.StatusCode)
+	}
+	if _, page := getPage(t, srv.URL+"/"); strings.Contains(page, `href="/setup"`) {
+		t.Fatal("page offers a setup the pack doesn't have")
+	}
+}
+
+// A loopback public_url isn't stamped anywhere; the version still describes the bytes /modpack serves.
+func TestModPackVersionUnstamped(t *testing.T) {
+	pack := writeTestPack(t, "FUSERNativeLoader.zip", map[string]string{"VERSION": "1.2.3", "FUSEROnline-Setup.exe": "MZexe"})
+	srv := newTestServerWith(t, func(c *config.Config) {
+		c.PublicURL = "http://127.0.0.1:8000"
+		c.ModPackFile = pack
+	})
+	raw, _ := os.ReadFile(pack)
+	sum := sha256.Sum256(raw)
+	_, body := getPage(t, srv.URL+"/modpack/version")
+	want := `{"version":"1.2.3","size":` + strconv.Itoa(len(raw)) + `,"sha256":"` + hex.EncodeToString(sum[:]) + `","url":"/modpack"}`
+	if strings.TrimSpace(body) != want {
+		t.Fatalf("version %s, want %s", body, want)
+	}
+	if _, setup := getPage(t, srv.URL+"/setup"); setup != "MZexe" {
+		t.Fatalf("setup %q", setup)
+	}
+}
+
+// A mod pack over maxStampBytes is served from disk as it is, but /setup still carries the server stamp.
+func TestModPackTooLargeToStamp(t *testing.T) {
+	old := maxStampBytes
+	maxStampBytes = 16
+	t.Cleanup(func() { maxStampBytes = old })
+	pack := writeTestPack(t, "FUSERNativeLoader.zip", map[string]string{"VERSION": "1.2.3", "FUSEROnline-Setup.exe": "MZexe"})
+	srv := newTestServerWith(t, func(c *config.Config) {
+		c.PublicURL = "https://fuser.example.org"
+		c.ModPackFile = pack
+	})
+	raw, _ := os.ReadFile(pack)
+	sum := sha256.Sum256(raw)
+	_, body := getPage(t, srv.URL+"/modpack/version")
+	want := `{"version":"1.2.3","size":` + strconv.Itoa(len(raw)) + `,"sha256":"` + hex.EncodeToString(sum[:]) + `","url":"/modpack"}`
+	if strings.TrimSpace(body) != want {
+		t.Fatalf("version %s, want %s", body, want)
+	}
+	if _, zipBody := getPage(t, srv.URL+"/modpack"); zipBody != string(raw) {
+		t.Fatal("an oversized mod pack isn't served as it is")
+	}
+	if _, setup := getPage(t, srv.URL+"/setup"); !strings.HasPrefix(setup, "MZexe") || !strings.HasSuffix(setup, "FUSERCFG") {
+		t.Fatalf("setup %q", setup)
 	}
 }

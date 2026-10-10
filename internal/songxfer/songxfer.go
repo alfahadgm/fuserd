@@ -68,13 +68,8 @@ func ShortName(path string) (string, bool) {
 		return "", false
 	}
 	x, file, ok := strings.Cut(rest, "/")
-	if !ok || x == "" || len(x) > 96 || file != "Meta_"+x+".Meta_"+x {
+	if !ok || !validShort(x) || file != "Meta_"+x+".Meta_"+x {
 		return "", false
-	}
-	for _, c := range x {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
-			return "", false
-		}
 	}
 	return x, true
 }
@@ -173,6 +168,10 @@ type Registry struct {
 	events    []Event
 	syncs     map[string]map[int64]syncPlayer // session -> player -> its sync state (Sync)
 	rounds    map[string]*syncRound
+	// song versions (versions.go)
+	held          map[string]map[int64]heldSongs       // session -> player -> its last report
+	failed        map[string]map[string]map[int64]bool // session -> song -> requesters whose transfer failed
+	seenConflicts map[string]map[string]bool           // session -> conflicts already returned
 }
 
 // New makes an empty registry.
@@ -349,6 +348,7 @@ func (r *Registry) advance(t *Transfer, reason string, isMember func(int64) bool
 		return
 	}
 	t.State, t.Reason = StateFailed, "no owner could send it (last: "+reason+")"
+	r.noteFailed(t)
 	r.events = append(r.events, Event{r.copyOf(t), "failed", from, reason})
 }
 
@@ -554,7 +554,7 @@ func (r *Registry) Report(sessionID, id string, player int64, state, reason stri
 	return r.copyOf(t), nil
 }
 
-// Drop cancels a session's transfers and forgets its presence and sync rounds (the session ended).
+// Drop cancels a session's transfers and forgets its presence, sync rounds and song reports (the session ended).
 func (r *Registry) Drop(sessionID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -566,6 +566,9 @@ func (r *Registry) Drop(sessionID string) {
 	delete(r.presence, sessionID)
 	delete(r.syncs, sessionID)
 	delete(r.rounds, sessionID)
+	delete(r.held, sessionID)
+	delete(r.failed, sessionID)
+	delete(r.seenConflicts, sessionID)
 }
 
 // ---- sync rounds ---------------------------------------------------------------------------------------------

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,7 +92,9 @@ func TestCommunityCommand(t *testing.T) {
 	}
 }
 
-// A real batch file imports cleanly: its line format is the entry format.
+// A batch in community_sync.py's output format imports cleanly: its line format is the entry format. The batch is
+// synthetic (made-up ids, names and links) with the kinds a real sync writes: rar5 and zip archives, the pak at the
+// top or in a folder of the archive, and loose folders.
 func TestCommunityImportSyncBatch(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
@@ -99,10 +103,55 @@ func TestCommunityImportSyncBatch(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	batch := filepath.Join(dir, "community_batch.jsonl")
+	if err := os.WriteFile(batch, []byte(syntheticSyncBatch()), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	var out strings.Builder
-	err := communityCommand([]string{"import", "-config", cfgPath, "-batch", filepath.Join("testdata", "community_batch.jsonl")},
-		strings.NewReader(""), &out)
+	err := communityCommand([]string{"import", "-config", cfgPath, "-batch", batch}, strings.NewReader(""), &out)
 	if err != nil || !strings.Contains(out.String(), "import: 12 added, 0 updated, 0 unchanged, 0 kept, 0 refused") {
 		t.Fatalf("import: %q %v", out.String(), err)
 	}
+}
+
+// syntheticSyncBatch is a community_sync.py-style JSON Lines batch of 12 made-up entries (a comment line first, as
+// the script writes): 1 rar5 archive, 5 zip archives (every other one with its files in a folder) and 6 folders.
+func syntheticSyncBatch() string {
+	var b strings.Builder
+	b.WriteString("# community_sync.py output (synthetic test data): 12 rows (rar5, zip, folders)\n")
+	line := func(v map[string]any) {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			panic(err)
+		}
+		b.Write(raw)
+		b.WriteByte('\n')
+	}
+	for i := 1; i <= 12; i++ {
+		x := fmt.Sprintf("Test_Song%02d_Fake", i)
+		id := func(n int) string { return fmt.Sprintf("FakeDriveId%02d%dabcdefghij", i, n) }
+		entry := map[string]any{"x": x, "artist": fmt.Sprintf("Test Artist %d", i), "title": fmt.Sprintf("Test Title %d", i),
+			"creator": "Test Creator", "submitted": "", "sheet": fmt.Sprintf("1000:%d", i+8), "note": "",
+			"link": "https://example.invalid/community/" + id(0)}
+		switch {
+		case i == 1:
+			entry["kind"], entry["archive"] = "archive", "rar5"
+			entry["files"] = []map[string]any{{"id": id(0), "name": x + ".rar", "size": 8_000_000 + i}}
+			entry["pak_entry"], entry["sig_entry"] = x+"_P.pak", x+"_P.sig"
+		case i%2 == 1:
+			folder := ""
+			if i%4 == 3 {
+				folder = fmt.Sprintf("Test Artist %d - Test Title %d/", i, i)
+			}
+			entry["kind"], entry["archive"] = "archive", "zip"
+			entry["files"] = []map[string]any{{"id": id(0), "name": fmt.Sprintf("Test Title %d.zip", i), "size": 9_000_000 + i}}
+			entry["pak_entry"], entry["sig_entry"] = folder+x+"_P.pak", folder+x+"_P.sig"
+		default:
+			entry["kind"] = "folder"
+			entry["files"] = []map[string]any{{"id": id(1), "name": x + "_P.pak", "size": 7_000_000 + i},
+				{"id": id(2), "name": x + "_P.sig", "size": 1080}}
+		}
+		line(entry)
+	}
+	return b.String()
 }

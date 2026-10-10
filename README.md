@@ -28,8 +28,9 @@ and log a `stub endpoint` warning, so a client session shows which ones it calls
 
 ## Build
 
-`fuserd` needs Go 1.26 or newer. It's built with `CGO_ENABLED=0` (SQLite is the pure-Go `modernc.org/sqlite`), so
-the binary needs no system libraries.
+`fuserd` needs Go 1.26 or newer; `go.mod` pins the `go1.26.9` toolchain, which a newer `go` fetches on its own
+(`GOTOOLCHAIN=auto`). Module checksums are committed in `go.sum`. It's built with `CGO_ENABLED=0` (SQLite is the
+pure-Go `modernc.org/sqlite`), so the binary needs no system libraries.
 
 ```sh
 go build -o fuserd ./cmd/fuserd
@@ -130,15 +131,32 @@ certificate, the console variable `n.VerifyPeer=0` relaxes the client's certific
   day.
 - **Diamond Stage**: the current Main Stage event's card, with viewer and headliner counts from fresh host
   reports. Missing or mismatched reports show the counts as unavailable. Reload the page to update.
-- **Get connected**: the `Game.ini` section above, built from `public_url` with every region URL pointing at this
-  server and a copy button. A closing callout says what players miss without the mod pack and links to the Mod
-  pack tab.
-- **Mod pack** (also opened by `/#mod-pack`): what the mod pack adds and the download link at `/modpack`. The
+- **Get connected**: when the mod pack holds the player installer, a download of FUSER Online Setup (`/setup`)
+  first, with three steps (run it; it finds FUSER from Steam or the Epic Games Store, points the game at this server
+  and installs the mod pack; Play). Then the `Game.ini` section above for connecting by hand, built from
+  `public_url` with every region URL pointing at this server and a copy button. A closing callout says what players
+  miss without the mod pack and links to the Mod pack tab.
+- **Mod pack** (also opened by `/#mod-pack`): what the mod pack adds and the setup download (`/setup`), with the
+  zip at `/modpack` as the alternative (only the zip when the pack has no installer). The
   stock-player text, the Diamond Stage item and the crate check item follow `multiplayer.separate_stock_players`,
   `main_stage.enabled` (with public servers) and `multiplayer.max_crate_songs`.
 
 The mod pack is whatever file `mod_pack_file` names (default `data/FUSERNativeLoader.zip`). It's opened on each
 request, so you can replace it without a restart. When it's missing, the page says so and `/modpack` returns 404.
+A zip that holds the player setup (`FUSEROnline-Setup.exe` from FUSERNativeLoader's `.\build.ps1 -Package`, or
+`Setup-FuserOnline.ps1` in older packs) is served with `server.txt` beside it set to `public_url`, replacing any it
+had, so the setup points the game at this server without asking. The stamped zip is kept in memory, so a pack over
+64 MB is served as it is (the `/setup` download still carries the address).
+
+| Path | Serves |
+|---|---|
+| `/modpack` | The mod pack zip (stamped with `server.txt` as above). |
+| `/setup` | `FUSEROnline-Setup.exe` from the zip's root, with `server=<public_url>`, that text's length (int32, little-endian) and `FUSERCFG` appended after the PE image; the installer reads its server address from there. 404 without a mod pack or an installer in it. |
+| `/modpack/version` | The installer's update check: `{"version", "size", "sha256", "url": "/modpack"}`, the loader version from the zip's root `VERSION` file and the size and SHA-256 of exactly the bytes `/modpack` serves. 404 without a mod pack or a `VERSION` in it. |
+
+A loopback `public_url` (the default) isn't written into either download. The stamped zip, the stamped installer and
+the checksum are built once per file version and `public_url`. All three count against `store.requests_per_minute`
+per client address.
 
 ## Authentication
 
@@ -319,8 +337,46 @@ ports from `base_port` in steps of `port_step` (at least 101).
   check off.
 - **"View a public session"** never starts a server. It joins a running show with room under `max_players`.
 
-Containers are left running when fuserd exits, so a restart doesn't end anyone's set. A restarted fuserd keeps off
-their ports.
+- **Reservations.** A ticket holds a place on its server from when it's placed until its player connects. A place
+  is given up 2 minutes after the server registered (or after the ticket's last poll while it was still being
+  placed, if later), so a slowly booting container keeps its players' places.
+- **Departures.** Each heartbeat lists the connected players. A player missing from it for 2 minutes (and placed
+  more than 2 minutes ago) is taken out of the server's session, so seats that players left by quitting the game are free
+  again, and the host role passes to the earliest-joined player left. Tickets still being placed are not touched.
+- **Recycling.** A container past `FDS_MAX_UPTIME_HOURS` reports `recycle_pending` and exits once empty. Until then
+  it takes no new tickets, viewers or browser joins, and stays listed on the website. The Main Stage keeps admitting.
+- **Warm pool** (`warm_servers`, default 0 = off). fuserd keeps this many public servers up with no player and no
+  reservation, started for `warm_rounds` rounds (1 to 10, default 1; 1, 2 and 3 rounds start with 32, 64 and 128
+  bars), so public tickets with that round count don't wait for a container to boot. Warm servers count against
+  `max_servers` and wait for players indefinitely; at most one is started every 15 s. The pool always leaves one
+  slot free for servers that tickets start (and one more for the Main Stage server while it isn't running), so
+  `warm_servers` is at most `max_servers` - 1, or `max_servers` - 2 with the Main Stage on. When a ticket, a private
+  session or the Main Stage still finds every slot taken, an idle warm server is stopped to make room; that request
+  fails, and the next one gets the slot once the container has exited.
+
+**Launch failures.** Three containers that stop before registering within 10 minutes pause every launch (public,
+private and Main Stage) for 2 minutes, doubling on each further trip up to 30 minutes; a server that registers ends
+the pause. Tickets that would need a new server meanwhile get "no public server available". After a Main Stage
+server fails, its restart waits 30 s, then 60 s, 120 s and 300 s on further consecutive failures; a clean exit (its
+scheduled restart) or a failure after 10 minutes of running starts the count over.
+
+**Ports.** A new server takes the first port of the plan that no server or `fuserd-*` container holds, that isn't
+cooling down, and whose game port and beacon port (game port + 100) fuserd can bind over UDP. A port another
+program holds is skipped for 5 minutes. A container that registers on other ports than it was given (its own were
+taken), or reports 0 for one (it isn't listening on it), is stopped at once, and both of its assigned ports cool
+down for 5 minutes.
+
+**Restarts.** Containers are left running when fuserd exits, so a restart doesn't end anyone's set. On startup
+fuserd lists the running `fuserd-*` containers:
+
+- a stray Main Stage server (one fuserd didn't stop, after a crash) is stopped before the new one starts;
+- a public or private container is re-adopted when it is clean: this `image`, a port of the port plan, this
+  fuserd's registration URL and session-token key, and a registration token in its environment (read with
+  `docker inspect`, never logged). Its heartbeats are accepted again and it takes tickets like any other server.
+  Players already in it keep playing, but their old fuserd sessions are gone;
+- any other `fuserd-*` container (another `image`, port plan, registration URL or `token_secret`, or another
+  fuserd's on the same Docker host) is left running, since it may still have players. No new server takes its ports
+  while it runs; an FDS whose heartbeats fuserd refuses exits once it is empty.
 
 ### FuserDedicatedServer (FDS)
 
@@ -335,6 +391,17 @@ their ports.
   - `POST /fds/v1/register` when it's ready;
   - `POST /fds/v1/status` every `fds_heartbeat_seconds`;
   - `POST /fds/v1/exit` when it shuts down.
+- **Held-back custom songs.** Every register and status reply carries `blocked_songs`: the lower-case shortnames
+  of the custom songs not every member of the server's session can play. FDS (with its `bBlockUnreadyCustomSongs`,
+  default on) doesn't relay those songs' SpawnDisc actions, because a stock client that gets a disc it can't load
+  stops playing that DJ's actions for the rest of the set. A song is held back
+  - while a member counts as stock (no loader report; see `separate_stock_players`): every custom song the members'
+    loaders report holding, lacking or asking other players for;
+  - while a member went without it: its loader gave up fetching it, or its transfer ran out of owners;
+  - while members hold different files of it (see [song versions](#song-transfers-between-players)).
+
+  Official songs never are. fuserd learns a session's songs from the loaders' `p2p/song/poll/`, so with `p2p.enabled`
+  or `p2p.song_transfers` off the list stays empty. A change is logged as `custom songs held back on the server`.
 - **Bearer tokens.** Each call carries a random per-container token, generated at launch and revoked when the
   container exits. It reaches the container only through its environment, and neither side logs it.
 - **Health.** A container that doesn't register within `startup_timeout_seconds`, or misses three heartbeats, is
@@ -637,7 +704,7 @@ membership, and counts against `p2p.requests_per_minute`.
 | Endpoint | Who | Body → answer |
 |---|---|---|
 | `POST /api/p2p/song/request/` | requester | `{game_session_id, song_path, owners}` → `{transfer}`. `song_path` must be `/Game/DLC/Songs/<X>/Meta_<X>.Meta_<X>`. `owners` are the members whose crates hold it. An open request for the same song is returned as is |
-| `POST /api/p2p/song/poll/` | every member, every 2 s | `{game_session_id, sending, syncing, sync_failed}` → `{transfers, poll_ms, sync}`. `transfers` are the player's transfers, as requester or as the owner currently asked. `sending: false` declines every request waiting on the player. `syncing` / `sync_failed`: whether this player is fetching custom songs now, and how many of its batch it couldn't get |
+| `POST /api/p2p/song/poll/` | every member, every 2 s | `{game_session_id, sending, syncing, sync_failed, songs, missing}` → `{transfers, poll_ms, sync, conflicts}`. `transfers` are the player's transfers, as requester or as the owner currently asked. `sending: false` declines every request waiting on the player. `syncing` / `sync_failed`: whether this player is fetching custom songs now, and how many of its batch it couldn't get. `songs` / `missing`: the song report (below) |
 | `POST /api/p2p/song/offer/` | the asked owner | `{game_session_id, transfer_id, size, sha256, sig_size, sig_sha256, candidates, mapping}` → `{transfer}` with the pair id and key |
 | `POST /api/p2p/song/decline/` | the asked owner | `{game_session_id, transfer_id, reason}` (`not_found`, `not_custom`, `disabled`, `busy`) → `{transfer}`, now asking the next owner |
 | `POST /api/p2p/song/accept/` | requester | `{game_session_id, transfer_id, candidates, mapping}` → `{transfer}`. May be sent again with new candidates after a network change |
@@ -669,9 +736,17 @@ does. The poll's `sync` field is `{round, active, done_round, syncing, players, 
 are the finished round's players who fetched songs and the songs they couldn't get. Each loader announces a
 finished round to its player. A player who stops polling for 10 s no longer holds a round open.
 
+**Song versions.** A loader's poll may carry a song report: `songs`, `[{song, sha256}]`, the custom songs in the
+session's crates that its machine holds, with each pak's sha256, and `missing`, the crate songs its fetches ended
+without. Each report replaces the player's last one; a poll without `songs` (an older loader) keeps it. The answer's
+`conflicts`, `[{song, versions, players}]`, are the songs the session's members hold as different files (shortnames
+compared without case; official and catalogue songs left out). Players with different files hear different stems
+or miss cels, so each loader tells its player about every conflict. The reports also feed the
+[held-back custom songs](#fuserdedicatedserver-fds) of an FDS session.
+
 **Logging:** `P2P` lines for `song requested`, `song offered`, `song accepted`, `song report` and
-`song transfer next owner|failed|cancelled`, plus `song sync round started` / `finished`. Song polls log as
-`POLL`.
+`song transfer next owner|failed|cancelled`, plus `song sync round started` / `finished` and (once per song and
+session, as a warning) `custom song held as different files`. Song polls log as `POLL`.
 
 ## Profile pictures
 

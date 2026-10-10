@@ -30,8 +30,12 @@ type songRequest struct {
 	Sending       bool    `json:"sending"`
 	Syncing       bool    `json:"syncing"`     // poll: this player is fetching custom songs now
 	SyncFailed    int     `json:"sync_failed"` // poll: songs its current (or last) batch couldn't get
-	Reason        string  `json:"reason"`
-	State         string  `json:"state"`
+	// poll: the custom crate songs this machine holds, each with its pak's sha256 (absent: a loader that doesn't
+	// report them), and the crate songs its fetches ended without
+	Songs   *[]songHash `json:"songs"`
+	Missing []string    `json:"missing"`
+	Reason  string      `json:"reason"`
+	State   string      `json:"state"`
 	// report statistics, logged
 	Bytes int64  `json:"bytes"`
 	Ms    int64  `json:"ms"`
@@ -42,6 +46,11 @@ type songRequest struct {
 	SigSize   int64  `json:"sig_size"`
 	SigSHA256 string `json:"sig_sha256"`
 	p2p.Endpoint
+}
+
+type songHash struct {
+	Song   string `json:"song"`
+	SHA256 string `json:"sha256"`
 }
 
 // songSession decodes the request and finds its session, which the caller must be a member of.
@@ -126,8 +135,10 @@ func (s *Server) songRequestHandler(q *request) (any, error) {
 	return map[string]any{"transfer": songView(t, q.playerID())}, nil
 }
 
-// songPoll is POST p2p/song/poll/ {game_session_id, sending}: the player's transfers, as requester or as the owner
-// asked now. sending=false declines every request waiting on this player.
+// songPoll is POST p2p/song/poll/ {game_session_id, sending, syncing, sync_failed, songs, missing}: the player's
+// transfers, as requester or as the owner asked now. sending=false declines every request waiting on this player.
+// songs [{song, sha256}] and missing [shortname] are the loader's song report (songxfer.ReportSongs); the answer's
+// conflicts [{song, versions, players}] are the custom songs the session's members hold as different files.
 func (s *Server) songPoll(q *request) (any, error) {
 	req, sess, err := s.songSession(q)
 	if err != nil {
@@ -147,7 +158,32 @@ func (s *Server) songPoll(q *request) (any, error) {
 	case songxfer.SyncFinished:
 		s.p2pLog().Info("song sync round finished", "session", s.logs.Tag(sess.ID), "round", sync.Done, "players", sync.Players, "failed", sync.Failed)
 	}
-	return map[string]any{"transfers": views, "poll_ms": songPollMs, "sync": sync}, nil
+	if req.Songs != nil {
+		rep := songxfer.SongReport{Have: map[string]string{}, Missing: req.Missing}
+		for _, h := range *req.Songs {
+			rep.Have[h.Song] = h.SHA256
+		}
+		s.songs.ReportSongs(sess.ID, q.playerID(), rep)
+	}
+	conflicts, fresh := s.songs.Conflicts(sess.ID, memberSet(sess), s.sharedSong)
+	for _, c := range fresh {
+		s.p2pLog().Warn("custom song held as different files", "session", s.logs.Tag(sess.ID), "song", c.Song,
+			"versions", c.Versions, "players", c.Players)
+	}
+	return map[string]any{"transfers": views, "poll_ms": songPollMs, "sync": sync, "conflicts": conflicts}, nil
+}
+
+// sharedSong reports whether every player who holds song x holds the same file: an official song, or one of the
+// catalogue's, which fuserd hands out itself. Its version is never a conflict.
+func (s *Server) sharedSong(x string) bool {
+	if s.reservedShortName(x) {
+		return true
+	}
+	if c := s.cat(); c != nil {
+		_, ok := c.ByShortName(x)
+		return ok
+	}
+	return false
 }
 
 // songOffer is POST p2p/song/offer/ {game_session_id, transfer_id, size, sha256, sig_size, sig_sha256, candidates,

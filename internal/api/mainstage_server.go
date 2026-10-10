@@ -10,6 +10,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -67,8 +68,16 @@ func sameIP(a, b string) bool {
 }
 
 // superviseMainStage keeps the Main Stage server running while the Main Stage is enabled: it is started at once and
-// started again within 15 s of stopping (it also exits by itself for a scheduled restart, FDS_MAX_UPTIME_HOURS).
+// started again within 15 s of stopping (it also exits by itself for a scheduled restart, FDS_MAX_UPTIME_HOURS), or
+// after a backoff when it keeps failing (publichost.ErrPaused). It runs once at startup, so it first takes over the
+// containers a previous fuserd left running (stray Main Stage servers are stopped before a new one starts) and starts
+// the warm pool.
 func (s *Server) superviseMainStage() {
+	if s.fdsEnabled() {
+		s.public.Recover()
+		s.public.KeepWarm(s.cfg.Multiplayer.PublicServers.WarmServers, s.cfg.Multiplayer.PublicServers.WarmRounds,
+			s.cfg.MainStage.Enabled)
+	}
 	if !s.cfg.MainStage.Enabled || !s.fdsEnabled() {
 		if s.cfg.MainStage.Enabled {
 			s.logs.For(logx.MainStage).Warn("main stage server unavailable: it needs multiplayer.public_servers enabled")
@@ -76,10 +85,18 @@ func (s *Server) superviseMainStage() {
 		return
 	}
 	ms := s.cfg.MainStage
+	paused := false
 	ensure := func() {
-		if _, err := s.public.EnsureMainStage(ms.Venue, ms.TimeOfDay, ms.MaxPlayers); err != nil {
+		_, err := s.public.EnsureMainStage(ms.Venue, ms.TimeOfDay, ms.MaxPlayers)
+		switch {
+		case errors.Is(err, publichost.ErrPaused):
+			if !paused { // logged once per backoff, not every 15 s
+				s.logs.For(logx.MainStage).Warn("main stage server start backing off", "err", err)
+			}
+		case err != nil:
 			s.logs.For(logx.MainStage).Warn("main stage server not started", "err", err)
 		}
+		paused = errors.Is(err, publichost.ErrPaused)
 	}
 	ensure()
 	go func() {

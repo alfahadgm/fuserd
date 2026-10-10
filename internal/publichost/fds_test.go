@@ -1,6 +1,7 @@
 package publichost
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -17,6 +18,9 @@ func newFDSManager(t *testing.T, maxServers, maxPlayers int) *Manager {
 		PakKey: "secret-pak-key", Heartbeat: 10 * time.Second}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	m.start = func(*Slot) { m.runWG.Done() } // no Docker in tests
 	m.runningPorts = func() map[int]bool { return map[int]bool{} }
+	m.supervise = func(*Slot) { m.runWG.Done() }
+	m.portFree = func(int) bool { return true }
+	m.docker = func(context.Context, ...string) ([]byte, error) { return nil, errors.New("no docker in tests") }
 	return m
 }
 
@@ -59,9 +63,7 @@ func TestFDSRegistrationLifecycle(t *testing.T) {
 	if err := m.UpdateStatus(s.ID, token, Status{Players: 1}); err == nil {
 		t.Fatal("status accepted before register")
 	}
-	if err := m.Register(s.ID, token, Registration{Port: s.Port + 1}); err == nil {
-		t.Fatal("register accepted another port")
-	}
+	// (A register on another port stops the slot: TestPortConflictStopsAndCoolsDown.)
 	if err := m.Register(s.ID, token, Registration{Port: s.Port, Venue: "VenueC", Rounds: 1, TurnMeasure: 64}); err != nil {
 		t.Fatal(err)
 	}

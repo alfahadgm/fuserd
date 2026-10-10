@@ -3,6 +3,7 @@ package matchmaking
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -161,8 +162,18 @@ func TestManagedCancellationDuringStartup(t *testing.T) {
 	if _, err := m.CancelTicket(ticket.ID, 1); err != nil {
 		t.Fatal(err)
 	}
-	if m.CompleteManaged(ticket.ID, "slot-a", "198.51.100.10", 8000, 11) {
-		t.Fatal("cancelled ticket completed")
+	// The cancel gave the server reservation back: placing it must not ask for another release.
+	if placed, full := m.PlaceManaged(ticket.ID, "slot-a", "198.51.100.10", 8000, 11); placed || full {
+		t.Fatalf("cancelled ticket: placed %v, full %v", placed, full)
+	}
+	// A ticket that finds its session full fails there and still holds its reservation.
+	a, _ := m.CreateManagedPending(Player{ID: 2}, "slot-b", QueueFreestylePublic)
+	b, _ := m.CreateManagedPending(Player{ID: 3}, "slot-b", QueueFreestylePublic)
+	if placed, _ := m.PlaceManaged(a.ID, "slot-b", "198.51.100.10", 8000, 1); !placed {
+		t.Fatal("first ticket not placed")
+	}
+	if placed, full := m.PlaceManaged(b.ID, "slot-b", "198.51.100.10", 8000, 1); placed || !full {
+		t.Fatalf("ticket for a full session: placed %v, full %v", placed, full)
 	}
 }
 
@@ -335,4 +346,109 @@ func TestManagedPlayerSessionAndPrivateQueue(t *testing.T) {
 	if err != nil || mem.PlayerSessionID != issued[1] || !strings.Contains(mem.PlayerSessionID, ".slot-p.") {
 		t.Fatalf("invite join: %+v %v (issued %v)", mem, err, issued)
 	}
+}
+
+// A managed session drops the members its server stopped reporting (ReconcileManaged): 11 players cycle through an
+// 11-player slot, one at a time, and a 12th ticket still completes. Pending tickets are left alone and the host role
+// passes to the earliest-joined member left.
+func TestReconcileManagedDropsPlayersWhoLeft(t *testing.T) {
+	m, c := newTest(opts)
+	const slot, maxPlayers = "slot-r", 11
+	place := func(id int64) {
+		t.Helper()
+		ticket, _ := m.CreateManagedPending(Player{ID: id, IsDJ: true}, slot, QueueFreestylePublic)
+		if !m.CompleteManaged(ticket.ID, slot, "198.51.100.10", 7777, maxPlayers) {
+			t.Fatalf("player %d not placed", id)
+		}
+	}
+	for id := int64(1); id <= maxPlayers; id++ {
+		place(id)
+		c.advance(time.Minute)
+		// The server reports only the newest player: everyone before has quit the game.
+		m.ReconcileManaged(slot, []int64{id}, ReconcileGrace)
+		c.advance(time.Minute)
+		m.ReconcileManaged(slot, []int64{id}, ReconcileGrace)
+	}
+	c.advance(ReconcileGrace)
+	m.ReconcileManaged(slot, []int64{maxPlayers}, ReconcileGrace)
+	s, ok := m.ManagedSession(slot)
+	if !ok || len(s.Members) != 1 || s.HostID != maxPlayers {
+		t.Fatalf("after cycling: %+v %v", s, ok)
+	}
+	place(maxPlayers + 1)
+
+	// A just-placed player still loading in is kept; a pending ticket is untouched; the host passes on by join order.
+	pending, _ := m.CreateManagedPending(Player{ID: 50}, slot, QueueFreestylePublic)
+	c.advance(10 * time.Second)
+	place(13)
+	c.advance(10 * time.Second)
+	if dropped, _ := m.ReconcileManaged(slot, []int64{maxPlayers + 1}, ReconcileGrace); len(dropped) != 0 {
+		t.Fatalf("dropped before the grace: %v", dropped)
+	}
+	c.advance(ReconcileGrace)
+	dropped, ended := m.ReconcileManaged(slot, []int64{maxPlayers + 1, 13}, ReconcileGrace)
+	if !slices.Equal(dropped, []int64{maxPlayers}) || len(ended) != 0 {
+		t.Fatalf("dropped %v ended %v", dropped, ended)
+	}
+	if s, _ := m.ManagedSession(slot); s.HostID != maxPlayers+1 || len(s.Members) != 2 {
+		t.Fatalf("host %d members %+v", s.HostID, s.Members)
+	}
+	if got, _, _ := m.Ticket(pending.ID, 50); got.Status != StatusPlacing {
+		t.Fatalf("pending ticket %+v", got)
+	}
+	// A reported player who drops for a moment is kept.
+	m.ReconcileManaged(slot, []int64{13}, ReconcileGrace)
+	c.advance(ReconcileGrace / 2)
+	m.ReconcileManaged(slot, []int64{maxPlayers + 1, 13}, ReconcileGrace)
+	c.advance(ReconcileGrace)
+	if dropped, _ := m.ReconcileManaged(slot, []int64{maxPlayers + 1, 13}, ReconcileGrace); len(dropped) != 0 {
+		t.Fatalf("reconnected player dropped: %v", dropped)
+	}
+	// Everyone gone: the session ends, and the pending ticket starts a new one.
+	m.ReconcileManaged(slot, nil, ReconcileGrace)
+	c.advance(ReconcileGrace)
+	if _, ended := m.ReconcileManaged(slot, nil, ReconcileGrace); len(ended) != 1 || ended[0].Reason != "players left the server" {
+		t.Fatalf("ended %+v", ended)
+	}
+	if !m.CompleteManaged(pending.ID, slot, "198.51.100.10", 7777, maxPlayers) {
+		t.Fatal("pending ticket not placed after the session ended")
+	}
+	if s, _ := m.ManagedSession(slot); s.HostID != 50 {
+		t.Fatalf("new session host %d", s.HostID)
+	}
+}
+
+// A managed session's host who leaves hands the host role to the earliest-joined member.
+func TestManagedHostPassesToEarliestJoined(t *testing.T) {
+	m, c := newTest(opts)
+	for _, id := range []int64{5, 9, 2, 7} {
+		ticket, _ := m.CreateManagedPending(Player{ID: id}, "slot", QueueFreestylePublic)
+		if !m.CompleteManaged(ticket.ID, "slot", "198.51.100.10", 7777, 11) {
+			t.Fatal("placement")
+		}
+		c.advance(time.Second)
+	}
+	for _, want := range []int64{9, 2, 7} {
+		s, _ := m.ManagedSession("slot")
+		if _, err := m.CancelTicket(mustTicketOf(t, m, s.HostID), s.HostID); err != nil {
+			t.Fatal(err)
+		}
+		if s, _ := m.ManagedSession("slot"); s.HostID != want {
+			t.Fatalf("host %d, want %d", s.HostID, want)
+		}
+	}
+}
+
+// mustTicketOf is the id of a player's ticket.
+func mustTicketOf(t *testing.T, m *Manager, playerID int64) string {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, tk := range m.tickets {
+		if tk.PlayerID == playerID {
+			return id
+		}
+	}
+	t.Fatalf("no ticket for %d", playerID)
+	return ""
 }

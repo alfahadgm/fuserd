@@ -71,7 +71,9 @@
       "fds_register_url": "",
       "fds_pak_key_env": "FDS_PAK_KEY",
       "fds_heartbeat_seconds": 10,
-      "fds_session_tokens": true
+      "fds_session_tokens": true,
+      "warm_servers": 0,
+      "warm_rounds": 1
     }
   },
   "p2p": {

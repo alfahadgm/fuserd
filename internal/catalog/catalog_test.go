@@ -90,6 +90,28 @@ func songFiles(sn string) map[string][]byte {
 	}
 }
 
+func TestOwnedBySongAlbumArt(t *testing.T) {
+	for name, want := range map[string]bool{
+		"ui/albumart/t_song.uasset":        true,
+		"ui/albumart/t_song.uexp":          true,
+		"ui/albumart/t_song.ubulk":         true,
+		"ui/albumart/t_song_small.uasset":  true,
+		"ui/albumart/t_song_small.ubulk":   true,
+		"ui/albumart/t_songbird.uasset":    false, // another song's art
+		"ui/albumart/t_song_big.uexp":      false,
+		"ui/albumart/t_song":               false,
+		"ui/albumart/t_song.uexp.uasset":   false,
+		"ui/albumart/t_song_small.png":     false,
+		"ui/albumart/t_song/evil.uasset":   false,
+		"audio/songs/song/songbs/x.uasset": true,
+		"audio/songs/songbird/x.uasset":    false,
+	} {
+		if got := ownedBySong(name, "song"); got != want {
+			t.Errorf("ownedBySong(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
 func TestReadPakIndexAndInspect(t *testing.T) {
 	dir := t.TempDir()
 	pak := filepath.Join(dir, "Test_Song_P.pak")
